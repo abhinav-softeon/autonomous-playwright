@@ -1,0 +1,46 @@
+{
+  "www.youtube.com": {
+    "working": {
+      "input_field": "input[name=\"search_query\"]"
+    },
+    "failed": [
+      "#search-icon-legacy",
+      "input#search",
+      "button#search-icon-legacy",
+      "input#search-input",
+      "#search",
+      "button[aria-label='Search']",
+      "h3#video-title",
+      "ytd-video-renderer #video-title",
+      "ytd-rich-grid-renderer",
+      "a[aria-label='Git and Github Explained in 7 Minutes | Git and Github Tutorial (2026) 7 minutes']",
+      "#primary ytd-rich-grid-renderer ytd-video-renderer #video-title",
+      "ytd-video-renderer >> nth=0 >> span[class='view-count style-scope ytd-video-meta-block']",
+      "ytd-video-renderer >> span[class=\"view-count style-scope ytd-video-meta-block\"]",
+      "ytd-rich-grid-renderer ytd-video-renderer h3#video-title",
+      "ytd-video-renderer >> nth=0 >> span[class='view-count']",
+      "ytd-video-renderer >> nth=0 >> #metadata-line >> span:nth-child(1)",
+      "ytd-video-renderer >> nth=0 >> ytd-video-meta-block >> #metadata-line >> span:nth-child(1)",
+      "ytd-video-primary-info-renderer #title",
+      "ytd-video-primary-info-renderer #view-count",
+      "yt-formatted-string#video-title",
+      "ytd-video-primary-info-renderer yt-formatted-string#title",
+      "h1#title"
+    ]
+  },
+  "www.workday.com": {
+    "working": {},
+    "failed": [
+      "a[aria-label='Job Search']",
+      "input[aria-label='Search Workday']",
+      "button[aria-label='Main Menu']",
+      "button[aria-label='Company']",
+      "a[title='Careers']",
+      "a[title='About']",
+      "button[aria-label='Apply Now']",
+      "input[type='text']",
+      "button[aria-label='Apply']",
+      "input[name='q']"
+    ]
+  }
+}

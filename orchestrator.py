@@ -1,42 +1,54 @@
 """
-Multi-Agent Orchestrator — 4-Agent Pipeline
+Multi-Agent Orchestrator — 2-Role Pipeline
 --------------------------------------------
-Every task runs through four specialised agents:
+Every task runs through two kinds of specialised agents:
 
-  Agent 1 — DecompositionAgent
-    Input : big task (str)
-    Output: ordered list of subtasks stored in TaskState.plan
+  Orchestrator role — PlanningAgent
+    Input : big task (str) + finished-steps-so-far + live page state
+    Output: ordered list of REMAINING subtasks, EACH TAGGED WITH ITS TOOL
+            GROUP, stored in TaskState.plan (called once upfront, then
+            again after every finished step). Routing is decided here,
+            once per step — not re-decided on every retry.
 
-  Agent 2 — ToolSelectionAgent          (per loop iteration)
-    Input : current subtask + context + previous observations for this step
-    Output: which tool to call + what arguments to pass
+  Specialist role — SpecialistAgent     (one "flavor" per tool group)
+    Input : subtask goal + context + all observations/tool-calls so far
+            for this step + LIVE PAGE STATE (ground truth)
+    Output: ONE call does BOTH jobs:
+              1. Evaluate the previous tool result (if any) against the
+                 step goal → "done" | "retry" | "failed"
+              2. If not done/failed, choose the next tool + args from its
+                 group's tool list (full docstrings, not just names)
+            No separate router or evaluator call — self-contained.
 
-  Agent 3 — ToolExecutorAgent           (per loop iteration, no LLM)
+  ToolExecutorAgent                      (per loop iteration, no LLM)
     Input : tool_name + tool_args
     Output: raw tool observation (JSON str)
 
-  Agent 4 — EvaluationAgent             (per loop iteration)
-    Input : subtask goal + all observations collected so far for this step
-    Output: { status: "done" | "retry" | "failed", reason, answer }
-
   Loop per subtask:
-    ┌─────────────────────────────────────────────────────┐
-    │  while not done and retries < max_retries:           │
-    │    selected = ToolSelectionAgent.select(...)         │
-    │    observation = ToolExecutorAgent.execute(...)      │
-    │    evaluation = EvaluationAgent.evaluate(...)        │
-    │    if done  → store result, move to next subtask     │
-    │    if retry → loop again with updated observations   │
-    │    if failed → mark step failed, continue            │
-    └─────────────────────────────────────────────────────┘
+    ┌───────────────────────────────────────────────────────────┐
+    │  while True:                                                │
+    │    result = SpecialistAgent.act(...)  # evaluates prev +    │
+    │                                        # picks next tool    │
+    │    if result.status == "done"   → store result, next step  │
+    │    if result.status == "failed" → mark step failed         │
+    │    else → execute chosen tool, append observation, loop     │
+    │    (hard, non-LLM loop/error-storm detection runs after      │
+    │     every execution as a safety net the LLM can't argue      │
+    │     past)                                                    │
+    └───────────────────────────────────────────────────────────┘
 
-  OrchestratorAgent drives everything, fires events so
-  main.py can render live progress to the console.
+  OrchestratorAgent drives everything, fires the same event stream
+  (plan / step_start / loop_select / loop_execute / loop_eval /
+  step_done / step_failed / done) so main.py's rendering is unchanged.
 """
 
 import asyncio
+import difflib
+import inspect
 import json
 import logging
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -45,10 +57,15 @@ import selector_cache as sc
 from llm_agent import (
     BedrockClient,
     _user_message,
+    _tool_result_message,
     _extract_text,
     _extract_tool_uses,
     execute_tool_call,
     get_all_tool_schemas,
+    reset_loop_detection,
+    empty_usage,
+    add_usage,
+    usage_from_response,
 )
 import playwright_tools as pt
 
@@ -84,6 +101,8 @@ class LoopIteration:
     eval_status: LoopStatus = LoopStatus.RETRY
     eval_reason: str = ""        # evaluator's explanation
     eval_answer: str = ""        # populated when eval_status == DONE
+    screenshot: Optional[bytes] = None  # viewport JPEG after this tool ran — UI-only, never sent to the LLM
+    usage: dict = field(default_factory=empty_usage)  # tokens for the SpecialistAgent call behind this iteration
 
 
 @dataclass
@@ -91,6 +110,7 @@ class PlanStep:
     """One subtask in the decomposed plan."""
     index: int                   # 1-based
     description: str
+    group: str = ""               # tool group assigned by PlanningAgent
     status: StepStatus = StepStatus.PENDING
     result: str = ""             # final answer when DONE
     error: str = ""              # reason when FAILED
@@ -155,39 +175,61 @@ class OrchestratorEvent:
     Fired by OrchestratorAgent at every significant moment.
 
     event_type:
-      "plan"         — decomposition done, plan ready
+      "plan"         — planning done, remaining steps (with groups) ready
       "step_start"   — about to begin a subtask
-      "loop_select"  — ToolSelectionAgent chose a tool
+      "loop_select"  — SpecialistAgent chose the next tool
       "loop_execute" — tool executed, observation received
-      "loop_eval"    — EvaluationAgent returned verdict
+      "loop_eval"    — SpecialistAgent's evaluation of the previous result
       "step_done"    — subtask completed successfully
       "step_failed"  — subtask failed (all retries exhausted)
       "done"         — all subtasks done, final answer ready
+
+    usage/cumulative_usage carry token counts ({"input_tokens","output_tokens",
+    "total_tokens"}) for events backed by an actual LLM call ("plan",
+    "loop_select"/"loop_eval" [same call], "done"); zeroed for purely
+    mechanical events ("step_start", "loop_execute", "step_done", "step_failed").
     """
     event_type: str
     state: TaskState
     step: Optional[PlanStep] = None
     iteration: Optional[LoopIteration] = None
     final_answer: str = ""
+    usage: dict = field(default_factory=empty_usage)             # tokens for the LLM call behind THIS event
+    cumulative_usage: dict = field(default_factory=empty_usage)  # running total across the whole run so far
 
 
 # ===========================================================================
-# Agent 1 — DecompositionAgent
+# Agent 1 — PlanningAgent
 # ===========================================================================
 
-class DecompositionAgent:
+class PlanningAgent:
     """
-    Calls the LLM with a single forced tool submit_plan(steps, reasoning).
-    Forces structured output so we always get a clean ordered list.
+    Produces (and repeatedly revises) the REMAINING plan for a task, AND
+    assigns each step the tool group that will handle it — routing is
+    decided here, once per step, not re-decided on every retry inside the
+    step (the group needed for a subtask essentially never changes across
+    retries of that SAME subtask; when it does — e.g. an unexpected cookie
+    banner — the step ends as failed/blocked and gets replanned into a new
+    step with the right group, matching the "replan after every step"
+    design rather than adding a mid-step group-switch escape hatch).
+
+    Called once before the first step (with no finished steps yet), and
+    again after EVERY step reaches DONE or FAILED (with the finished steps'
+    results and the live page state). Returns an ordered list of remaining
+    (step description, tool group) pairs — the LLM decides whether that's
+    one step at a time (just-in-time) or several (a full plan); an EMPTY
+    list means the task is already fully answered by the finished steps.
     """
 
     _TOOL = {
         "toolSpec": {
             "name": "submit_plan",
             "description": (
-                "Submit the ordered step-by-step plan for the task. "
-                "Each step must be a single concrete, self-contained browser action "
-                "that a Playwright automation agent can execute independently."
+                "Submit the ordered list of REMAINING steps needed to finish the task, "
+                "each tagged with the tool group that will handle it. Each step must be "
+                "a single concrete, self-contained browser action that a Playwright "
+                "automation specialist can execute independently. Return an EMPTY steps "
+                "list if the task is already fully answered."
             ),
             "inputSchema": {
                 "json": {
@@ -195,12 +237,28 @@ class DecompositionAgent:
                     "properties": {
                         "steps": {
                             "type": "array",
-                            "description": "Ordered list of step descriptions.",
-                            "items": {"type": "string"},
+                            "description": (
+                                "Ordered list of remaining steps. "
+                                "Empty if the task is already fully answered."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "description": {
+                                        "type": "string",
+                                        "description": "The concrete step to perform.",
+                                    },
+                                    "group": {
+                                        "type": "string",
+                                        "description": "Exact tool group name that handles this step.",
+                                    },
+                                },
+                                "required": ["description", "group"],
+                            },
                         },
                         "reasoning": {
                             "type": "string",
-                            "description": "Why you chose this breakdown.",
+                            "description": "Why this plan (or why the task is already complete).",
                         },
                     },
                     "required": ["steps", "reasoning"],
@@ -209,43 +267,166 @@ class DecompositionAgent:
         }
     }
 
-    _SYSTEM = (
-        "You are a task decomposition agent for a browser automation system. "
-        "Break the given task into ordered steps. Each step must have a single observable "
-        "success condition — something verifiable in the page URL, title, or visible text.\n"
+    _SYSTEM_TEMPLATE = (
+        "You are a task planning agent for a browser automation system. "
+        "You are called repeatedly as the task progresses: once at the start, then again "
+        "after every step finishes. Decide the REMAINING steps needed to finish the task, "
+        "and which TOOL GROUP handles each one.\n\n"
+        "AVAILABLE TOOL GROUPS:\n{group_list}\n\n"
+        "You may OPTIONALLY call search_elements(terms) first to confirm whether something "
+        "specific already exists on the LIVE PAGE (e.g. a login button, cookie banner, search "
+        "box) instead of guessing from the sampled elements alone — do this at most twice, "
+        "then you MUST call submit_plan. If search_elements returns a selector for a step's "
+        "target element, put that selector directly in the step's description (e.g. \"Click "
+        "the login link (selector: a[aria-label='Log in'])\") so the specialist can use it "
+        "immediately instead of searching again.\n\n"
         "RULES:\n"
+        "- Each step must have a single observable success condition — something "
+        "  verifiable in the page URL, title, or visible text.\n"
         "- A step that involves entering data AND submitting must be split into two steps.\n"
         "- Never create a step whose only purpose is waiting.\n"
         "- Do not create separate steps for finding a page and going to it — that is one step. "
         "  If a destination has a known URL, prefer navigating to it directly.\n"
         "- Do not duplicate steps with overlapping goals.\n"
-        "Always call submit_plan to return your plan."
+        "- If FINISHED STEPS already fully answer the ORIGINAL TASK, return an EMPTY steps list.\n"
+        "- If LIVE PAGE STATE reveals something unexpected (cookie banner, login wall, error "
+        "  page), insert a step in the right group to handle it before continuing.\n"
+        "- Keep remaining steps that are still valid — do not needlessly rewrite steps that "
+        "  do not need to change.\n"
+        "- The browser is already open. Never assign a step to a group for starting/stopping it.\n"
+        "- Assign EVERY step the single best-matching group from the list above.\n"
+        "Always call submit_plan."
     )
 
     def __init__(self, llm: BedrockClient):
         self.llm = llm
-
-    async def decompose(self, task: str) -> tuple[list[str], str]:
-        """
-        Returns (steps, reasoning).
-        Falls back to [task] as single step if the model doesn't call the tool.
-        """
-        response = await self.llm.converse(
-            messages=[_user_message(f"Decompose this task into steps:\n\n{task}")],
-            system=self._SYSTEM,
-            tools=[self._TOOL],
+        self._search_tool = next(
+            (s for s in get_all_tool_schemas() if s["toolSpec"]["name"] == "search_elements"),
+            None,
         )
-        blocks = response["output"]["message"].get("content", [])
-        tool_uses = _extract_tool_uses(blocks)
 
-        if not tool_uses:
-            logger.warning("DecompositionAgent: no tool call — single-step fallback")
-            return [task], "Single step fallback."
+    def _build_group_list(self, available: set[str]) -> str:
+        lines = []
+        for name in available:
+            grp = TOOL_GROUPS[name]
+            lines.append(f"  {name} — {grp['description']}")
+        return "\n".join(lines)
 
-        inp = tool_uses[0].get("input", {})
-        steps = [s.strip() for s in inp.get("steps", [task]) if s.strip()]
-        reasoning = inp.get("reasoning", "")
-        return steps, reasoning
+    async def plan_next(
+        self,
+        original_task: str,
+        finished_steps: list["PlanStep"],
+        live_state: str,
+        max_search_rounds: int = 2,
+    ) -> tuple[list[tuple[str, str]], str, dict]:
+        """
+        Returns (remaining_steps, reasoning, usage) where remaining_steps is a
+        list of (description, group) pairs — group is validated against
+        TOOL_GROUPS and corrected/defaulted if hallucinated. `usage` is the
+        summed token usage of every converse() call made during this
+        plan_next() invocation (a search round can trigger more than one).
+
+        Before committing to a plan, the model may call search_elements(terms)
+        up to max_search_rounds times to confirm what's actually on the LIVE
+        PAGE (e.g. does a login wall really exist) instead of guessing from the
+        live_state summary alone. search_elements is read-only, so this is safe
+        to allow during planning without blurring planning vs. execution —
+        unlike exposing an action tool (click/fill/...) would be.
+
+        Fallback if the model doesn't call the tool: on the very first call
+        (no finished steps yet) falls back to a single step (whole task,
+        'navigation' group) rather than risk looping forever on a broken
+        planner response; on later calls falls back to [] (assume complete).
+        """
+        if finished_steps:
+            finished_summary = "\n".join(
+                f"  Step {s.index}: {s.description}\n"
+                f"  Status: {s.status.value}\n"
+                f"  Result: {(s.result or s.error)[:400]}"
+                for s in finished_steps
+            )
+        else:
+            finished_summary = "  (none yet — this is the initial plan)"
+
+        try:
+            page = pt._state.get("page")
+            has_page = bool(page and page.url not in ("about:blank", "", None))
+        except Exception:
+            has_page = False
+        available = _POST_NAV_GROUPS if has_page else _PRE_NAV_GROUPS
+        default_group = "discovery" if has_page else "navigation"
+
+        prompt = (
+            f"ORIGINAL TASK:\n{original_task}\n\n"
+            f"FINISHED STEPS:\n{finished_summary}\n\n"
+            f"LIVE PAGE STATE:\n{live_state or '(browser not yet navigated)'}\n\n"
+            "What are the REMAINING steps needed? Return an empty list if already done."
+        )
+        system = self._SYSTEM_TEMPLATE.format(group_list=self._build_group_list(available))
+
+        messages = [_user_message(prompt)]
+        # search_elements only makes sense once a page actually exists to search
+        can_search = has_page and self._search_tool is not None
+        usage = empty_usage()
+
+        for round_num in range(max_search_rounds + 1):
+            tools = [self._TOOL]
+            if can_search and round_num < max_search_rounds:
+                tools.append(self._search_tool)
+
+            response = await self.llm.converse(messages=messages, system=system, tools=tools)
+            usage = add_usage(usage, usage_from_response(response))
+            blocks = response["output"]["message"].get("content", [])
+            tool_uses = _extract_tool_uses(blocks)
+
+            if not tool_uses:
+                if not finished_steps:
+                    logger.warning("PlanningAgent: no tool call on initial plan — single-step fallback")
+                    return [(original_task, default_group)], "Single step fallback.", usage
+                logger.warning("PlanningAgent: no tool call on replan — assuming task complete")
+                return [], "No tool call from planner; assuming complete.", usage
+
+            submit_call = next((t for t in tool_uses if t.get("name") == "submit_plan"), None)
+
+            if submit_call is None:
+                search_call = next((t for t in tool_uses if t.get("name") == "search_elements"), None)
+                if search_call is not None:
+                    logger.info("PlanningAgent: searching screen before planning — terms=%s",
+                                search_call.get("input", {}).get("terms"))
+                    result_json = await execute_tool_call("search_elements", search_call.get("input", {}))
+                    messages.append(response["output"]["message"])
+                    messages.append(_tool_result_message(search_call["toolUseId"], result_json))
+                    continue
+                # Unrecognized tool call — treat like no tool call
+                logger.warning("PlanningAgent: unrecognized tool call — fallback")
+                if not finished_steps:
+                    return [(original_task, default_group)], "Single step fallback.", usage
+                return [], "Unrecognized tool call from planner; assuming complete.", usage
+
+            inp = submit_call.get("input", {})
+            reasoning = inp.get("reasoning", "")
+
+            steps: list[tuple[str, str]] = []
+            for raw in inp.get("steps", []):
+                desc = str(raw.get("description", "")).strip()
+                if not desc:
+                    continue
+                group = raw.get("group", "")
+                if group not in TOOL_GROUPS:
+                    matches = difflib.get_close_matches(group, available, n=1, cutoff=0.4)
+                    corrected = matches[0] if matches else default_group
+                    logger.warning("PlanningAgent: corrected group '%s' → '%s'", group, corrected)
+                    group = corrected
+                steps.append((desc, group))
+
+            return steps, reasoning, usage
+
+        # Exhausted search rounds without ever getting a submit_plan call
+        logger.warning("PlanningAgent: exhausted %d search rounds without a plan — fallback",
+                       max_search_rounds)
+        if not finished_steps:
+            return [(original_task, default_group)], "Exhausted search rounds fallback.", usage
+        return [], "Exhausted search rounds; assuming complete.", usage
 
 
 # ===========================================================================
@@ -257,11 +438,22 @@ TOOL_GROUPS: dict[str, dict] = {
         "description": "Go to URLs, go back/forward, reload the page",
         "tools": ["navigate", "go_back", "go_forward", "reload", "get_current_url"],
     },
-    "page_reading": {
-        "description": "Read the current page structure, HTML, text, or element attributes",
-        "tools": ["get_page_html", "get_page_snapshot", "get_text_blocks",
-                  "get_text", "get_all_text", "get_attribute", "get_input_value",
-                  "get_page_content", "evaluate_js", "evaluate_js_on_element"],
+    "discovery": {
+        "description": (
+            "Find AND read anything on the page that isn't a form/click action: locate an "
+            "element by guessed keywords, inspect one candidate in detail, or read page "
+            "structure/HTML/text/attributes — including extracting visible data like counts, "
+            "prices, or dates. Use search_elements FIRST when you don't already have a selector; "
+            "reach for the page/text-reading tools when you need the actual content, not just "
+            "a selector. A single step needing both (e.g. 'find and read the view count') stays "
+            "in this ONE group — never split across two."
+        ),
+        # get_page_html/get_page_snapshot are deliberately absent: get_page_structure
+        # is now the single page representation (see playwright_tools._page_view).
+        "tools": ["search_elements", "expand_element",
+                  "get_page_structure", "get_text_blocks", "get_text", "get_all_text",
+                  "get_attribute", "get_input_value", "get_page_content", "evaluate_js",
+                  "evaluate_js_on_element"],
     },
     "form_input": {
         "description": "Type into inputs, fill forms, select dropdowns, check boxes, upload files",
@@ -308,205 +500,143 @@ TOOL_GROUPS: dict[str, dict] = {
 _PRE_NAV_GROUPS = {"navigation", "network"}
 
 # Groups that are relevant on any loaded page
-_POST_NAV_GROUPS = {"navigation", "page_reading", "form_input", "clicking",
+_POST_NAV_GROUPS = {"navigation", "discovery", "form_input", "clicking",
                     "waiting", "tabs_frames", "capture", "assertions", "storage", "network"}
 
 
 # ===========================================================================
-# Agent 2a — ToolRouterAgent  (picks the group, ~8 choices)
+# Specialist role — SpecialistAgent  (self-contained: evaluates + selects)
 # ===========================================================================
 
-class ToolRouterAgent:
+@dataclass
+class ActResult:
+    """Result of one SpecialistAgent.act() call."""
+    status: str             # "done" | "retry" | "failed"
+    eval_reason: str = ""
+    answer: str = ""
+    tool_name: str = ""
+    tool_args: dict = field(default_factory=dict)
+    reasoning: str = ""
+    usage: dict = field(default_factory=empty_usage)
+
+
+class SpecialistAgent:
     """
-    Layer 1 of the 2-layer tool selector.
-    Sees only group names (~8 choices) and picks which specialist group
-    is most appropriate for the current step.
-    Tiny choice set → near-zero hallucination.
+    One specialist "flavor" per tool group (parameterised by `group` at call
+    time, same as the pool of TOOL_GROUPS). Replaces the old ToolSpecialistAgent
+    + EvaluationAgent split: every call does BOTH jobs in one LLM round trip:
+
+      1. EVALUATE — if there's a previous result for this step, judge whether
+         the step goal is now achieved, against LIVE PAGE STATE (ground
+         truth), not just whether the tool call itself reported success.
+      2. ACT — if not done/failed, pick the next tool + args from this
+         group's tool list (shown with FULL docstrings, not truncated).
+
+    Self-grading bias (an agent rubber-stamping its own last action) is
+    mitigated by carrying the same skeptical rules the old EvaluationAgent
+    had — verbatim — into this prompt (see EVALUATION RULES below), and by
+    fetching a FRESH live URL/title each call rather than trusting the tool
+    call's own self-reported status.
+
+    Hard, non-LLM loop/error-storm detection is NOT here — see
+    _check_hard_stop(), a deterministic safety net the LLM can't argue past.
     """
 
-    _ROUTE_TOOL = {
+    _ACT_TOOL = {
         "toolSpec": {
-            "name": "select_group",
-            "description": "Select the tool group most appropriate for the next action.",
+            "name": "act",
+            "description": (
+                "Evaluate the previous tool result for this step (if any) and choose what "
+                "happens next: 'done' (goal fully achieved, provide answer), 'failed' "
+                "(impossible, explain why), or 'retry' (provide the next tool_name + tool_args)."
+            ),
             "inputSchema": {
                 "json": {
                     "type": "object",
                     "properties": {
-                        "group": {
+                        "status": {
                             "type": "string",
-                            "description": "The tool group name to use.",
+                            "description": "'done', 'retry', or 'failed'.",
                         },
-                        "reasoning": {
+                        "eval_reason": {
                             "type": "string",
-                            "description": "Why this group is the right one.",
+                            "description": "Why this status — what LIVE PAGE STATE / OBSERVATIONS show.",
                         },
-                    },
-                    "required": ["group", "reasoning"],
-                }
-            },
-        }
-    }
-
-    _SYSTEM_TEMPLATE = (
-        "You are a routing agent for a browser automation system. "
-        "Your only job is to pick which TOOL GROUP is needed next.\n\n"
-        "AVAILABLE GROUPS:\n{group_list}\n\n"
-        "Rules:\n"
-        "- The browser is already open. Never pick a group for starting/stopping the browser.\n"
-        "- Always call select_group with your choice."
-    )
-
-    def __init__(self, llm: BedrockClient):
-        self.llm = llm
-        self._valid_groups = set(TOOL_GROUPS.keys())
-
-    def _build_group_list(self, available: set[str]) -> str:
-        lines = []
-        for name in available:
-            grp = TOOL_GROUPS[name]
-            lines.append(f"  {name} — {grp['description']}")
-        return "\n".join(lines)
-
-    async def route(
-        self,
-        step_description: str,
-        context: str,
-        observations: list[str],
-    ) -> tuple[str, str]:
-        """
-        Pick a tool group.
-
-        Returns:
-            (group_name, reasoning)
-        """
-        has_page = any("html" in o or "navigated_to" in o or "page_url" in o
-                       for o in observations)
-        if not has_page:
-            try:
-                current_url = pt._state["page"].url if pt._state["page"] else ""
-                has_page = bool(current_url and current_url not in ("about:blank", ""))
-            except Exception:
-                pass
-        available = _POST_NAV_GROUPS if has_page else _PRE_NAV_GROUPS
-
-        # Give router current URL + last non-HTML observation so it has page context
-        page_context = ""
-        try:
-            if pt._state.get("page"):
-                page_context = f"\nCurrent URL: {pt._state['page'].url}"
-        except Exception:
-            pass
-
-        obs_summary = ""
-        if observations:
-            # Strip html blobs, show last observation status
-            for o in reversed(observations):
-                try:
-                    parsed = json.loads(o)
-                    display = {k: v for k, v in parsed.items()
-                               if k not in ("html", "page_html") and len(str(v)) < 300}
-                    obs_summary = f"\nLast observation: {json.dumps(display)[:400]}"
-                    break
-                except Exception:
-                    obs_summary = f"\nLast observation: {o[:300]}"
-                    break
-
-        prompt = (
-            f"CURRENT STEP GOAL:\n{step_description}\n\n"
-            f"CONTEXT:\n{context}"
-            f"{page_context}"
-            f"{obs_summary}\n\n"
-            "Which tool GROUP should be used for the next action?"
-        )
-
-        system = self._SYSTEM_TEMPLATE.format(
-            group_list=self._build_group_list(available)
-        )
-
-        response = await self.llm.converse(
-            messages=[_user_message(prompt)],
-            system=system,
-            tools=[self._ROUTE_TOOL],
-        )
-        blocks = response["output"]["message"].get("content", [])
-        tool_uses = _extract_tool_uses(blocks)
-
-        if not tool_uses:
-            fallback = "page_reading" if has_page else "navigation"
-            logger.warning("ToolRouterAgent: no tool call — fallback to '%s'", fallback)
-            return fallback, "Fallback"
-
-        inp = tool_uses[0].get("input", {})
-        group = inp.get("group", "page_reading")
-
-        # Correct hallucinated group names
-        if group not in self._valid_groups:
-            import difflib
-            matches = difflib.get_close_matches(group, available, n=1, cutoff=0.4)
-            group = matches[0] if matches else ("page_reading" if has_page else "navigation")
-            logger.warning("ToolRouterAgent: corrected group to '%s'", group)
-
-        return group, inp.get("reasoning", "")
-
-
-# ===========================================================================
-# Agent 2b — ToolSpecialistAgent  (picks exact tool, ~5 choices)
-# ===========================================================================
-
-class ToolSpecialistAgent:
-    """
-    Layer 2 of the 2-layer tool selector.
-    Receives a specific tool group (chosen by ToolRouterAgent) and picks
-    the exact tool + arguments from that group's small tool list (~3–9 tools).
-    Tiny choice set → near-zero hallucination.
-    """
-
-    _SELECT_TOOL = {
-        "toolSpec": {
-            "name": "select_tool",
-            "description": "Select the exact tool to call and specify its arguments.",
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
+                        "answer": {
+                            "type": "string",
+                            "description": "Concise result summary. Required when status is 'done'.",
+                        },
                         "tool_name": {
                             "type": "string",
-                            "description": "Exact tool name from the available list.",
+                            "description": "Exact next tool name. Required when status is 'retry'.",
                         },
                         "tool_args": {
                             "type": "object",
-                            "description": "Arguments as key-value pairs.",
+                            "description": "Arguments for tool_name as key-value pairs.",
                         },
                         "reasoning": {
                             "type": "string",
                             "description": "Why this tool and these args.",
                         },
                     },
-                    "required": ["tool_name", "tool_args", "reasoning"],
+                    "required": ["status", "eval_reason"],
                 }
             },
         }
     }
 
     _SYSTEM_TEMPLATE = (
-        "You are a specialist tool agent for browser automation. "
-        "You have been assigned the '{group}' group. "
-        "Choose the SINGLE best tool from the list below to make progress on the current step.\n\n"
+        "You are a specialist tool agent for browser automation, assigned to the '{group}' group. "
+        "Every turn you must do BOTH of these, in order:\n"
+        "  1. EVALUATE — if OBSERVATIONS below already contains a result from a previous action "
+        "     on this step, judge whether the CURRENT STEP GOAL is now fully achieved. Judge "
+        "     against LIVE PAGE STATE (the actual URL/title), NOT just whether the tool call "
+        "     itself reported success.\n"
+        "  2. ACT — if the goal is not yet achieved and is not impossible, choose the SINGLE "
+        "     best next tool call from the list below to make progress.\n\n"
         "AVAILABLE TOOLS IN THIS GROUP:\n{tool_list}\n\n"
         "SELECTOR SYNTAX — you may use any of these:\n"
+        "  aria-ref=e12                 a ref copied from get_page_structure's outline ← PREFER THIS\n"
         "  #id                          when the element has an id\n"
         "  a[href*='careers']           match part of a URL\n"
-        "  button:has-text(\"Company\")   match by visible text  ← USE THIS when no id/aria-label\n"
+        "  button:has-text(\"Company\")   match by visible text  ← use when no id/aria-label/ref\n"
         "  text=Careers                 exact visible text\n"
         "  a >> nth=3                   positional, last resort\n"
         "Never invent a URL. Only navigate to hrefs you have READ from the page HTML.\n\n"
-        "RULES:\n"
+        "EVALUATION RULES:\n"
+        "1. A tool returning 'status: ok' means the CALL executed, NOT that the goal was reached.\n"
+        "2. For NAVIGATION steps: the URL in LIVE PAGE STATE must reflect the destination. "
+        "   If the title contains '404', 'Not Found', or 'Page not found', the navigation FAILED — "
+        "   the URL does not exist. Set status='retry' and pick a corrected next action.\n"
+        "3. A URL you constructed from memory is NOT evidence the page exists. Verify the title "
+        "   is not an error page before setting status='done'.\n"
+        "4. For IN-PAGE changes (menus, dialogs): URL will NOT change — judge by whether new "
+        "   elements appeared in OBSERVATIONS.\n"
+        "5. Repetition and selector-error storms are caught mechanically — you don't need to set "
+        "   status='failed' just because a tool call is being retried.\n"
+        "6. If OBSERVATIONS has no result yet for THIS step, set status='retry' and simply choose "
+        "   your first tool call — there is nothing to evaluate yet.\n"
+        "7. NEVER set status='done' unless the 'answer' text is copied or directly derived from "
+        "   content that literally appears in OBSERVATIONS or LIVE PAGE STATE above. Do not "
+        "   invent, estimate, or recall a plausible-sounding value from general knowledge (a view "
+        "   count, price, date, name, etc. you have not actually seen in this conversation). If "
+        "   the needed data is not yet visible, set status='retry' and pick a tool that would "
+        "   reveal it instead of guessing.\n\n"
+        "TOOL SELECTION RULES:\n"
         "1. Only use tool names exactly as listed above.\n"
-        "2. Derive selectors from the CURRENT PAGE HTML in the prompt — "
-        "   prefer id, aria-label/title, name, text, then href for links.\n"
-        "3. Never pass a 'timeout' parameter.\n"
-        "4. To submit a search form: use press_key(selector, 'Enter') on the input.\n"
-        "5. Always call select_tool."
+        "2. If the STEP GOAL already names a specific selector (e.g. \"(selector: ...)\"), "
+        "   use it directly — it was already confirmed by the planner, no need to search again.\n"
+        "3. Otherwise, if this group includes get_page_structure, call it FIRST — it's a "
+        "   compact outline with visible text AND refs ([ref=e12]) you can copy directly as "
+        "   \"aria-ref=e12\". Use search_elements(terms) with a few guessed words (e.g. "
+        "   ['login', 'sign in']) to filter it when the page is too large to read whole. Use "
+        "   expand_element(selector) to see full detail on one candidate before acting on it.\n"
+        "4. Otherwise (or if the outline is missing something, e.g. a raw href) derive selectors "
+        "   from the CURRENT PAGE HTML in the prompt — prefer id, aria-label/title, name, text, "
+        "   then href for links.\n"
+        "5. Never pass a 'timeout' parameter.\n"
+        "6. To submit a search form: use press_key(selector, 'Enter') on the input.\n"
+        "7. Always call act."
     )
 
     def __init__(self, llm: BedrockClient, all_tool_schemas: list[dict]):
@@ -514,37 +644,35 @@ class ToolSpecialistAgent:
         self._schema_map = {s["toolSpec"]["name"]: s for s in all_tool_schemas}
 
     def _tool_list_for_group(self, group: str) -> str:
+        """Full docstrings (not truncated) for every tool in this group."""
         tools = TOOL_GROUPS.get(group, {}).get("tools", [])
-        lines = []
+        sections = []
         for name in tools:
-            schema = self._schema_map.get(name)
-            if not schema:
+            func = getattr(pt, name, None)
+            if func is None:
                 continue
-            spec = schema["toolSpec"]
-            props = spec["inputSchema"]["json"].get("properties", {})
-            required = spec["inputSchema"]["json"].get("required", [])
-            param_str = ", ".join(props.keys())
-            req_note  = f" [required: {', '.join(required)}]" if required else ""
-            lines.append(f"  {name}({param_str}){req_note} — {spec['description'][:100]}")
-        return "\n".join(lines)
+            doc = inspect.getdoc(func) or "(no description)"
+            sections.append(f"### {name}\n{doc}")
+        return "\n\n".join(sections)
 
     def _valid_tools_for_group(self, group: str) -> set[str]:
         return set(TOOL_GROUPS.get(group, {}).get("tools", []))
 
-    async def select(
+    async def act(
         self,
         group: str,
         step_description: str,
         context: str,
         observations: list[str],
-        feedback: str = "",
+        tool_calls: list[dict],
         tried: list[dict] | None = None,
-    ) -> tuple[str, dict, str]:
+    ) -> ActResult:
         """
-        Pick exact tool + args within the given group.
+        Evaluate the previous observation for this step (if any) and choose
+        the next tool call, in ONE LLM call.
 
         Returns:
-            (tool_name, tool_args, reasoning)
+            ActResult with status "done" | "retry" | "failed".
         """
         obs_section = ""
         available_selectors = []
@@ -615,16 +743,6 @@ class ToolSpecialistAgent:
         except Exception:
             pass
 
-        tool_list = self._tool_list_for_group(group)
-        system = self._SYSTEM_TEMPLATE.format(group=group, tool_list=tool_list)
-
-        # Evaluator feedback (recency: placed near end of prompt)
-        feedback_section = ""
-        if feedback:
-            feedback_section = (
-                f"\n\nEVALUATOR FEEDBACK — act on this, do something DIFFERENT:\n{feedback}"
-            )
-
         tried_section = ""
         if tried:
             sigs = [f"  {c['tool']}({json.dumps(c['args'])[:120]})" for c in (tried or [])]
@@ -633,49 +751,126 @@ class ToolSpecialistAgent:
                 + "\n".join(sigs)
             )
 
+        # Fresh LIVE PAGE STATE (ground truth) — the anti-self-grading-bias check.
+        # Settle the page first — a previous evaluate_js navigation may not have
+        # completed by the time we read the URL.
+        live_state = ""
+        try:
+            if pt._state.get("page"):
+                p = pt._state["page"]
+                try:
+                    await p.wait_for_load_state("domcontentloaded", timeout=3000)
+                except Exception:
+                    pass
+                title = await p.title()
+                live_state = (
+                    f"\n\nLIVE PAGE STATE (ground truth — judge against this, not tool status):\n"
+                    f"  URL:   {p.url}\n"
+                    f"  Title: {title}\n"
+                )
+        except Exception:
+            pass
+
+        tool_list = self._tool_list_for_group(group)
+        system = self._SYSTEM_TEMPLATE.format(group=group, tool_list=tool_list)
+
         prompt = (
             f"STEP GOAL:\n{step_description}\n\n"
             f"CONTEXT:\n{context}"
             f"{obs_section}"
             f"{cache_hints}"
             f"{html_section}"
+            f"{selector_section}"
             f"{tried_section}"
-            f"{feedback_section}\n\n"
-            f"You are in the '{group}' group. Which tool should be called next?"
+            f"{live_state}\n\n"
+            f"You are in the '{group}' group. Evaluate any previous result, then decide what happens next."
         )
 
         response = await self.llm.converse(
             messages=[_user_message(prompt)],
             system=system,
-            tools=[self._SELECT_TOOL],
+            tools=[self._ACT_TOOL],
         )
-        logger.info("SPECIALIST prompt=%d chars | html=%d | selectors=%d",
-                    len(prompt), len(latest_html), len(available_selectors))
+        usage = usage_from_response(response)
+        logger.info("SPECIALIST(%s) prompt=%d chars | html=%d | selectors=%d",
+                    group, len(prompt), len(latest_html), len(available_selectors))
         blocks = response["output"]["message"].get("content", [])
         tool_uses = _extract_tool_uses(blocks)
 
-        valid = self._valid_tools_for_group(group)
-
         if not tool_uses:
-            fallback = "get_page_html"
-            logger.warning("ToolSpecialistAgent(%s): no tool call — fallback to '%s'", group, fallback)
-            return fallback, {}, "Fallback"
+            logger.warning("SpecialistAgent(%s): no tool call — retry fallback", group)
+            return ActResult(status="retry", eval_reason="No tool call from specialist.", usage=usage)
 
         inp = tool_uses[0].get("input", {})
+        raw_status = str(inp.get("status", "retry")).lower()
+        if raw_status not in ("done", "retry", "failed"):
+            raw_status = "retry"
+        eval_reason = inp.get("eval_reason", "")
+        answer = inp.get("answer", "")
+
+        # Deterministic anti-hallucination guard: an empty answer on "done" means
+        # the model declared success without actually grounding a value in
+        # anything observed — force it back to retry rather than accept a
+        # silent no-op success (see EVALUATION RULES rule 7 above).
+        if raw_status == "done" and not answer.strip():
+            logger.warning("SpecialistAgent(%s): 'done' with empty answer — forcing retry", group)
+            raw_status = "retry"
+            eval_reason = (
+                "Rejected: status was 'done' but 'answer' was empty — you must ground the "
+                "answer in something actually observed before marking this step complete."
+            )
+
+        if raw_status != "retry":
+            return ActResult(status=raw_status, eval_reason=eval_reason, answer=answer, usage=usage)
+
+        # status == "retry" -> validate/correct the chosen tool_name
+        valid = self._valid_tools_for_group(group)
         raw_name = inp.get("tool_name", "")
+        tool_args = inp.get("tool_args", {})
+        reasoning = inp.get("reasoning", "")
 
-        # Validate + fuzzy-correct within the group's tool list
         if raw_name not in valid:
-            import difflib
-            matches = difflib.get_close_matches(raw_name, valid, n=1, cutoff=0.4)
-            if matches:
-                logger.warning("ToolSpecialistAgent: '%s' → corrected to '%s'", raw_name, matches[0])
-                raw_name = matches[0]
-            else:
-                raw_name = next(iter(valid), "get_page_html")
-                logger.warning("ToolSpecialistAgent: no match for '%s' — fallback to '%s'", inp.get("tool_name"), raw_name)
+            # Some models occasionally emit a real tool name followed by
+            # garbled pseudo-tool-call syntax inside the SAME string, e.g.
+            # 'get_text_blocks>\n<__parameter=tool_args>{"limit": 1}'.
+            # Try recovering the leading identifier before fuzzy-matching
+            # the whole garbled blob (which rarely matches anything well).
+            prefix_match = re.match(r"[a-zA-Z_][a-zA-Z0-9_]*", raw_name)
+            prefix = prefix_match.group(0) if prefix_match else ""
 
-        return raw_name, inp.get("tool_args", {}), inp.get("reasoning", "")
+            if prefix in valid:
+                logger.warning("SpecialistAgent: recovered '%s' from garbled tool_name '%s'",
+                                prefix, raw_name[:80])
+                raw_name = prefix
+            else:
+                matches = difflib.get_close_matches(raw_name, valid, n=1, cutoff=0.4)
+                if matches:
+                    logger.warning("SpecialistAgent: '%s' → corrected to '%s'", raw_name, matches[0])
+                    raw_name = matches[0]
+                else:
+                    # No confident match at all — tool_args were meant for a
+                    # different/unclear tool and may not even be valid kwargs
+                    # here, so fall back to a tool with NO required params in
+                    # this group (safe to call with no args) and drop them.
+                    safe_fallback = next(
+                        (name for name in valid
+                         if not self._schema_map.get(name, {})
+                                .get("toolSpec", {}).get("inputSchema", {})
+                                .get("json", {}).get("required")),
+                        next(iter(valid)),
+                    )
+                    logger.warning(
+                        "SpecialistAgent: no match for '%s' — safe fallback to '%s()' with no args",
+                        inp.get("tool_name"), safe_fallback,
+                    )
+                    raw_name = safe_fallback
+                    tool_args = {}
+
+        return ActResult(
+            status="retry", eval_reason=eval_reason,
+            tool_name=raw_name, tool_args=tool_args, reasoning=reasoning,
+            usage=usage,
+        )
 
 
 
@@ -702,184 +897,41 @@ class ToolExecutorAgent:
 
 
 # ===========================================================================
-# Agent 4 — EvaluationAgent
+# Hard, non-LLM safety nets (moved out of the old EvaluationAgent)
 # ===========================================================================
+# The LLM-judgment part of evaluation (was the previous EvaluationAgent) now
+# lives inside SpecialistAgent.act() — it self-evaluates its own last tool
+# call, since it has richer per-group context than a generic evaluator did.
+# These two checks stay as PLAIN PYTHON, deliberately separate from any LLM
+# call, so a model can never talk its way past an actual infinite loop or a
+# storm of selector failures.
 
-class EvaluationAgent:
+def _check_hard_stop(tool_calls: list[dict], observations: list[str]) -> tuple[bool, str]:
     """
-    Reads all observations collected so far for the current step and decides:
-      "done"   — the step goal has been fully achieved
-      "retry"  — not done yet, the executor should try another tool
-      "failed" — cannot proceed (error, impossible, loop detected)
-
-    Uses a forced tool call evaluate_step(status, reason, answer).
+    Deterministic loop/error-storm detection across the whole step so far.
+    Returns (should_fail, reason).
     """
+    # ── Hard loop detection ─────────────────────────────────────────────
+    # Count across the whole step, not just the last 3 — interleaved
+    # repetition slips through a consecutive-only check.
+    if len(tool_calls) >= 3:
+        sig_counts = Counter(
+            f"{c['tool']}:{json.dumps(c['args'], sort_keys=True)}"
+            for c in tool_calls
+        )
+        worst, n = sig_counts.most_common(1)[0]
+        if n >= 3:
+            return True, f"'{worst.split(':')[0]}' attempted {n} times across this step with no progress."
 
-    _EVAL_TOOL = {
-        "toolSpec": {
-            "name": "evaluate_step",
-            "description": (
-                "Evaluate whether the current step goal has been achieved "
-                "based on the observations collected so far."
-            ),
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "status": {
-                            "type": "string",
-                            "description": (
-                                "'done' if the step goal is fully achieved, "
-                                "'retry' if more tool calls are needed, "
-                                "'failed' if it is impossible to complete."
-                            ),
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Explanation for your verdict.",
-                        },
-                        "answer": {
-                            "type": "string",
-                            "description": (
-                                "Concise result summary for this step. "
-                                "Required when status is 'done'."
-                            ),
-                        },
-                    },
-                    "required": ["status", "reason", "answer"],
-                }
-            },
-        }
-    }
-
-    _SYSTEM = (
-        "You are a step evaluation agent for a browser automation system. "
-        "You receive a step goal, the LIVE PAGE STATE (ground truth), and tool call observations. "
-        "Decide: done (goal achieved), retry (more work needed), failed (impossible).\n"
-        "RULES:\n"
-        "1. A tool returning 'status: ok' means the CALL executed, NOT that the goal was reached.\n"
-        "2. For NAVIGATION steps: the URL in LIVE PAGE STATE must reflect the destination. "
-        "   If the title contains '404', 'Not Found', or 'Page not found', the navigation FAILED — "
-        "   the URL does not exist. Return retry and suggest navigating to a correct URL.\n"
-        "3. A URL the agent constructed from memory is NOT evidence the page exists. "
-        "   Verify the title is not an error page before returning done.\n"
-        "4. For IN-PAGE steps (expand menu, open dialog): URL will NOT change — "
-        "   judge by whether new elements appeared.\n"
-        "5. Never return failed because a tool was repeated — repetition is detected mechanically.\n"
-        "6. When retrying: state exactly what is missing AND suggest a concrete next action.\n"
-        "Always call evaluate_step."
-    )
-
-    def __init__(self, llm: BedrockClient):
-        self.llm = llm
-
-    async def evaluate(
-        self,
-        step_description: str,
-        observations: list[str],
-        tool_calls: list[dict],
-    ) -> tuple[LoopStatus, str, str]:
-        """
-        Evaluate step progress.
-
-        Args:
-            step_description: What this step needs to accomplish
-            observations: All tool outputs collected for this step so far
-            tool_calls: Corresponding tool name + args for each observation
-
-        Returns:
-            (LoopStatus, reason, answer)
-        """
-        # ── Hard loop detection (no LLM needed) ────────────────────────────
-        # Count across the whole step, not just the last 3 — interleaved
-        # repetition slips through a consecutive-only check.
-        if len(tool_calls) >= 3:
-            from collections import Counter
-            sig_counts = Counter(
-                f"{c['tool']}:{json.dumps(c['args'], sort_keys=True)}"
-                for c in tool_calls
-            )
-            worst, n = sig_counts.most_common(1)[0]
-            if n >= 3:
-                return (
-                    LoopStatus.FAILED,
-                    f"'{worst.split(':')[0]}' attempted {n} times across this step with no progress.",
-                    "",
-                )
-
-        # ── Selector error storm ──────────────────────────────────────────
-        if len(observations) >= 3:
-            if sum(1 for o in observations[-3:] if "SELECTOR ERROR" in o) == 3:
-                return (
-                    LoopStatus.FAILED,
-                    "3 consecutive selector validation failures — cannot find a valid selector. "
-                    "Try navigating directly to the target URL instead.",
-                    "",
-                )
-
-        obs_lines = []
-        for i, (obs, call) in enumerate(zip(observations, tool_calls)):
-            try:
-                parsed = json.loads(obs)
-                display = {k: v for k, v in parsed.items() if k not in ("html", "page_html")}
-                body = json.dumps(display)[:600]
-            except Exception:
-                body = obs[:600]
-            obs_lines.append(
-                f"  Call {i+1}: {call['tool']}({json.dumps(call['args'])[:100]})\n"
-                f"  Result: {body}"
+    # ── Selector error storm ─────────────────────────────────────────────
+    if len(observations) >= 3:
+        if sum(1 for o in observations[-3:] if "SELECTOR ERROR" in o) == 3:
+            return True, (
+                "3 consecutive selector validation failures — cannot find a valid selector. "
+                "Try navigating directly to the target URL instead."
             )
 
-        # Settle the page before reading live state — evaluate_js navigation
-        # may not have completed by the time we read the URL.
-        live_state = ""
-        try:
-            if pt._state.get("page"):
-                p = pt._state["page"]
-                try:
-                    await p.wait_for_load_state("domcontentloaded", timeout=3000)
-                except Exception:
-                    pass
-                title = await p.title()
-                live_state = (
-                    f"\nLIVE PAGE STATE (ground truth from the browser — judge against this):\n"
-                    f"  URL:   {p.url}\n"
-                    f"  Title: {title}\n"
-                )
-        except Exception:
-            pass
-
-        prompt = (
-            f"STEP GOAL:\n{step_description}\n"
-            f"{live_state}\n"
-            f"TOOL CALLS AND OBSERVATIONS:\n" + "\n\n".join(obs_lines) + "\n\n"
-            "Has this step goal been fully achieved? "
-            "Judge against LIVE PAGE STATE, not against tool call status."
-        )
-
-        response = await self.llm.converse(
-            messages=[_user_message(prompt)],
-            system=self._SYSTEM,
-            tools=[self._EVAL_TOOL],
-        )
-        blocks = response["output"]["message"].get("content", [])
-        tool_uses = _extract_tool_uses(blocks)
-
-        if not tool_uses:
-            # Fallback: assume retry if evaluator doesn't respond
-            return LoopStatus.RETRY, "Evaluator gave no verdict — retrying", ""
-
-        inp = tool_uses[0].get("input", {})
-        raw_status = inp.get("status", "retry").lower()
-        reason = inp.get("reason", "")
-        answer = inp.get("answer", "")
-
-        try:
-            status = LoopStatus(raw_status)
-        except ValueError:
-            status = LoopStatus.RETRY
-
-        return status, reason, answer
+    return False, ""
 
 
 # ===========================================================================
@@ -888,17 +940,24 @@ class EvaluationAgent:
 
 class OrchestratorAgent:
     """
-    Coordinates all agents for every task.
+    Coordinates both agent roles for every task.
 
     Flow:
-      1. DecompositionAgent       → plan stored in TaskState
+      1. PlanningAgent  → plan (remaining steps, EACH TAGGED WITH ITS GROUP)
+                          stored in TaskState
       2. For each PlanStep:
-           while not done and retries < max_retries_per_step:
-             a. ToolRouterAgent     → picks tool GROUP   (~8 choices)
-             b. ToolSpecialistAgent → picks exact tool + args  (~3-9 choices)
-             c. ToolExecutorAgent   → executes (no LLM)
-             d. EvaluationAgent     → done / retry / failed
-      3. _build_summary()          → final LLM call
+           while True:
+             a. SpecialistAgent.act(group, ...) → evaluates the previous
+                tool result for this step (if any) AND, in the SAME call,
+                picks the next tool + args — no separate router/evaluator
+                LLM call.
+             b. if status == done/failed → store result, stop retrying
+             c. else → ToolExecutorAgent executes the chosen tool (no LLM),
+                then a hard, non-LLM loop/error-storm check runs before
+                looping back to (a)
+         then PlanningAgent.plan_next() runs again to revise the remaining
+         plan (and re-assign groups for any new steps)
+      3. _build_summary()  → final LLM call
     """
 
     _SUMMARY_SYSTEM = (
@@ -914,7 +973,10 @@ class OrchestratorAgent:
         max_tokens: int = 4096,
         temperature: float = 0.0,
         max_retries_per_step: int = 8,
+        max_total_steps: int = 25,
         on_event: Optional[Callable[[OrchestratorEvent], Any]] = None,
+        reasoning_budget_tokens: Optional[int] = None,
+        on_delta: Optional[Callable[[str, str], Any]] = None,
     ):
         """
         Args:
@@ -923,28 +985,46 @@ class OrchestratorAgent:
             profile: AWS CLI profile name
             max_tokens: Max response tokens per LLM call
             temperature: Sampling temperature
+            reasoning_budget_tokens: Enable model reasoning/"thinking" on every
+                agent in the pipeline. Provider-neutral — see BedrockClient.
             max_retries_per_step: How many Select→Execute→Evaluate loops per step
+            max_total_steps: Safety cap on how many steps will be executed in total.
+                             The plan is now regenerated after every step (see
+                             PlanningAgent), so unlike a fixed upfront plan there is
+                             no natural end unless the planner returns an empty
+                             remaining-list — this cap bounds worst-case cost/looping.
             on_event: Callback(OrchestratorEvent) for live display in main.py
+            on_delta: Callback(kind, text) fired per chunk as any agent in the
+                pipeline produces it, so planning/selection/evaluation text
+                appears live rather than only at event boundaries. Shared by
+                every agent here since they share one client.
         """
-        self._llm = BedrockClient(
+        self._llm = BedrockClient.create(
             model_id=model_id,
             region=region,
             profile=profile,
             max_tokens=max_tokens,
             temperature=temperature,
+            reasoning_budget_tokens=reasoning_budget_tokens,
+            on_delta=on_delta,
         )
         self._playwright_tools = get_all_tool_schemas()
         self._max_retries = max_retries_per_step
+        self._max_total_steps = max_total_steps
         self.on_event = on_event
+        self._total_usage: dict = empty_usage()
 
         # Agents (shared LLM client)
-        self._decomposer  = DecompositionAgent(self._llm)
-        self._router      = ToolRouterAgent(self._llm)
-        self._specialist  = ToolSpecialistAgent(self._llm, self._playwright_tools)
+        self._planner     = PlanningAgent(self._llm)
+        self._specialist  = SpecialistAgent(self._llm, self._playwright_tools)
         self._executor    = ToolExecutorAgent()
-        self._evaluator   = EvaluationAgent(self._llm)
 
     # ── event helper ────────────────────────────────────────────────────────
+
+    def _track(self, usage: dict) -> dict:
+        """Add `usage` to the running total and return the new cumulative total."""
+        self._total_usage = add_usage(self._total_usage, usage)
+        return self._total_usage
 
     async def _fire(self, event: OrchestratorEvent) -> None:
         if self.on_event is None:
@@ -953,135 +1033,33 @@ class OrchestratorAgent:
         if asyncio.iscoroutine(result):
             await result
 
-    async def _task_already_complete(self, original_task: str, state: TaskState) -> tuple[bool, str]:
-        """
-        After a step completes, quickly check whether the original task is already
-        fully answered by the accumulated step results — if so, skip remaining steps.
-        Uses a single small LLM call with forced yes/no answer.
-        """
-        done_steps = state.completed_steps
-        if not done_steps:
-            return False, ""
-
-        results_summary = "\n".join(
-            f"  Step {s.index}: {s.description}\n  Result: {s.result[:300]}"
-            for s in done_steps
-        )
-
-        _TOOL = {
-            "toolSpec": {
-                "name": "task_verdict",
-                "description": "Report whether the original task is fully answered.",
-                "inputSchema": {
-                    "json": {
-                        "type": "object",
-                        "properties": {
-                            "complete": {"type": "boolean",
-                                         "description": "True if the original task is fully answered."},
-                            "answer":   {"type": "string",
-                                         "description": "The final answer if complete=true, else empty."},
-                        },
-                        "required": ["complete", "answer"],
-                    }
-                },
-            }
-        }
-
-        prompt = (
-            f"ORIGINAL TASK:\n{original_task}\n\n"
-            f"COMPLETED STEPS AND RESULTS:\n{results_summary}\n\n"
-            "Is the original task FULLY answered by these results? "
-            "Call task_verdict with complete=true only if every piece of "
-            "information the task asked for is present."
-        )
-
-        try:
-            response = await self._llm.converse(
-                messages=[_user_message(prompt)],
-                system=(
-                    "You are a task completion checker. "
-                    "Return complete=true only if the task is fully and concretely answered. "
-                    "Always call task_verdict."
-                ),
-                tools=[_TOOL],
-            )
-            blocks = response["output"]["message"].get("content", [])
-            tool_uses = _extract_tool_uses(blocks)
-            if tool_uses:
-                inp = tool_uses[0].get("input", {})
-                if inp.get("complete"):
-                    return True, inp.get("answer", "")
-        except Exception as e:
-            logger.debug("_task_already_complete check failed: %s", e)
-
-        return False, ""
-
-    def _correct_selector(
-        self, tool_name: str, tool_args: dict, observations: list[str]
-    ) -> dict:
-        """
-        If the specialist returned a selector that isn't on the live page,
-        find the closest real selector from the observations and substitute it.
-        This is a pure string-matching correction — no LLM call.
-        """
-        _SELECTOR_PARAM_TOOLS = {
-            "fill", "type_text", "press_key", "click", "hover", "focus",
-            "select_option", "check_checkbox", "uncheck_checkbox",
-            "get_text", "get_attribute", "get_input_value",
-            "wait_for_selector", "assert_visible", "assert_text",
-        }
-        if tool_name not in _SELECTOR_PARAM_TOOLS:
-            return tool_args
-
-        chosen = tool_args.get("selector", "")
-        if not chosen:
-            return tool_args
-
-        # Collect all real selectors from observations
-        real_selectors: list[str] = []
-        for o in observations:
-            try:
-                parsed = json.loads(o)
-                for el in parsed.get("elements", []):
-                    s = el.get("selector", "")
-                    if s:
-                        real_selectors.append(s)
-                # Also pull from error message selectors
-                error_text = parsed.get("error", "")
-                if "SELECTOR ERROR" in error_text:
-                    for line in error_text.splitlines():
-                        stripped = line.strip()
-                        if stripped.startswith(("input", "button", "a[", "textarea",
-                                                "select", "a#", "button#")):
-                            s = stripped.split("  (")[0].strip()
-                            if s:
-                                real_selectors.append(s)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        if not real_selectors or chosen in real_selectors:
-            return tool_args  # selector is valid or nothing to compare against
-
-        # Try to find the best matching real selector
-        import difflib
-        matches = difflib.get_close_matches(chosen, real_selectors, n=1, cutoff=0.3)
-        if matches:
-            corrected = matches[0]
-            if corrected != chosen:
-                logger.warning(
-                    "Selector auto-corrected: '%s' → '%s'", chosen, corrected
-                )
-                new_args = dict(tool_args)
-                new_args["selector"] = corrected
-                return new_args
-
-        return tool_args
-
     # ── main entry point ────────────────────────────────────────────────────
+
+    async def _live_state_summary(self) -> str:
+        """Compact live page state for the planner — URL/title + a sample of
+        indexed elements. Never the full HTML (would defeat the point)."""
+        if not pt._state.get("page"):
+            return ""
+        try:
+            page = pt._state["page"]
+            summary = f"URL: {page.url}\nTitle: {await page.title()}"
+            nodes = await pt._ensure_page_index()
+            if nodes:
+                sample = [
+                    f"  {n.get('kind', '')}: "
+                    f"{n.get('aria_label') or n.get('text') or n.get('id') or n.get('tag')}"
+                    for n in nodes[:15]
+                ]
+                summary += "\nVisible elements (sample):\n" + "\n".join(sample)
+            return summary
+        except Exception:
+            return ""
 
     async def run(self, task: str) -> str:
         """
-        Execute the full 4-agent pipeline for a task.
+        Execute the pipeline for a task: plan → (route → select → execute →
+        evaluate)* per step → replan from live state → repeat until the
+        planner reports nothing remains → summarise.
 
         Args:
             task: High-level task in plain English
@@ -1090,29 +1068,31 @@ class OrchestratorAgent:
             Final answer string.
         """
         state = TaskState(original_task=task)
+        reset_loop_detection()
 
-        # ── Phase 1: Decompose ───────────────────────────────────────────
-        steps, decomp_reasoning = await self._decomposer.decompose(task)
-        logger.info("Decomposition reasoning: %s", decomp_reasoning)
-
-        state.plan = [
-            PlanStep(index=i + 1, description=desc)
-            for i, desc in enumerate(steps)
-        ]
-
-        await self._fire(OrchestratorEvent(
-            event_type="plan",
-            state=state,
-        ))
-
-        # ── Phase 2: Start browser once for the whole task ────────────────
+        # ── Phase 1: Start browser once for the whole task ────────────────
         browser_start_obs = await execute_tool_call("start_browser", {})
         logger.info("Browser started: %s", browser_start_obs)
         browser_result = json.loads(browser_start_obs)
         if "error" in browser_result:
             raise RuntimeError(f"Failed to start browser: {browser_result['error']}")
-        # ── Phase 3: Execute each step ───────────────────────────────────────
-        for i, plan_step in enumerate(state.plan):
+
+        # ── Phase 2: Initial plan ──────────────────────────────────────────
+        initial_steps, plan_reasoning, plan_usage = await self._planner.plan_next(task, [], "")
+        logger.info("Initial plan reasoning: %s", plan_reasoning)
+        state.plan = [
+            PlanStep(index=i + 1, description=desc, group=group)
+            for i, (desc, group) in enumerate(initial_steps)
+        ]
+        await self._fire(OrchestratorEvent(
+            event_type="plan", state=state,
+            usage=plan_usage, cumulative_usage=self._track(plan_usage),
+        ))
+
+        # ── Phase 3: Execute steps, replanning after each one ──────────────
+        i = 0
+        while i < len(state.plan) and i < self._max_total_steps:
+            plan_step = state.plan[i]
             state.current_step_index = i
             plan_step.status = StepStatus.RUNNING
 
@@ -1120,170 +1100,198 @@ class OrchestratorAgent:
                 event_type="step_start",
                 state=state,
                 step=plan_step,
+                cumulative_usage=self._total_usage,
             ))
 
-            step_done = False
-            last_feedback = ""  # evaluator's retry reason threaded to next iteration
+            pending_iteration: Optional[LoopIteration] = None  # awaiting evaluation
+            loop_num = 0
 
-            for loop_num in range(1, self._max_retries + 1):
+            while True:
 
-                # Re-fetch page state every iteration so specialist is never blind
+                # Re-fetch page state every iteration so the specialist is never
+                # blind. One view (structure), not html + elements — this runs on
+                # EVERY loop iteration, so it was the single most repeated payload
+                # in the whole pipeline.
                 page_obs = None
                 if pt._state.get("page"):
                     try:
-                        ph   = await pt.get_page_html()
-                        snap = await pt.get_page_snapshot()
-                        page_obs = json.dumps({
-                            "page_state": True,
-                            "url":      ph["url"],
-                            "title":    ph["title"],
-                            "html":     ph["html"],
-                            "elements": snap.get("elements", []),
-                        })
+                        page_obs = json.dumps({"page_state": True, **await pt._page_view()})
                     except Exception:
                         pass
 
                 context = state.context_for_step()
                 # Always prepend fresh page state; append prior step observations after
                 observations = ([page_obs] if page_obs else []) + plan_step.all_observations
-                tool_calls   = plan_step.all_tool_calls
 
-                # ── Agent 2a: Route to group ─────────────────────────────
-                group, route_reasoning = await self._router.route(
-                    plan_step.description, context, observations
-                )
-
-                # ── Agent 2b: Pick exact tool in group ──────────────────
-                tool_name, tool_args, sel_reasoning = await self._specialist.select(
-                    group, plan_step.description, context, observations,
-                    feedback=last_feedback,
+                # ── Specialist: evaluate the previous result (if any) AND
+                #    pick the next tool call, in ONE call ───────────────────
+                result = await self._specialist.act(
+                    group=plan_step.group,
+                    step_description=plan_step.description,
+                    context=context,
+                    observations=observations,
+                    tool_calls=plan_step.all_tool_calls,
                     tried=plan_step.all_tool_calls,
                 )
-                sel_reasoning = f"[{group}] {sel_reasoning}"
+                # One LLM call serves BOTH the loop_eval and loop_select events
+                # below — count it toward the running total exactly once here.
+                specialist_cumulative = self._track(result.usage)
 
-                # Build a partial iteration to carry state through the loop
+                # Close out whatever iteration was awaiting evaluation
+                if pending_iteration is not None:
+                    pending_iteration.eval_status = (
+                        LoopStatus(result.status) if result.status in ("done", "retry", "failed")
+                        else LoopStatus.RETRY
+                    )
+                    pending_iteration.eval_reason = result.eval_reason
+                    pending_iteration.eval_answer = result.answer
+                    await self._fire(OrchestratorEvent(
+                        event_type="loop_eval",
+                        state=state,
+                        step=plan_step,
+                        iteration=pending_iteration,
+                        usage=result.usage,
+                        cumulative_usage=specialist_cumulative,
+                    ))
+                    pending_iteration = None
+
+                if result.status == "done":
+                    plan_step.result = result.answer
+                    plan_step.status = StepStatus.DONE
+                    await self._fire(OrchestratorEvent(
+                        event_type="step_done",
+                        state=state,
+                        step=plan_step,
+                        cumulative_usage=self._total_usage,
+                    ))
+                    break
+
+                if result.status == "failed":
+                    plan_step.error = result.eval_reason
+                    plan_step.status = StepStatus.FAILED
+                    await self._fire(OrchestratorEvent(
+                        event_type="step_failed",
+                        state=state,
+                        step=plan_step,
+                        cumulative_usage=self._total_usage,
+                    ))
+                    break
+
+                # status == "retry" — execute the chosen tool, if still within budget
+                loop_num += 1
+                if loop_num > self._max_retries:
+                    plan_step.status = StepStatus.FAILED
+                    plan_step.error = f"Max retries ({self._max_retries}) reached without completion."
+                    await self._fire(OrchestratorEvent(
+                        event_type="step_failed",
+                        state=state,
+                        step=plan_step,
+                        cumulative_usage=self._total_usage,
+                    ))
+                    break
+
                 iteration = LoopIteration(
                     number=loop_num,
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    selection_reasoning=sel_reasoning,
+                    tool_name=result.tool_name,
+                    tool_args=result.tool_args,
+                    selection_reasoning=f"[{plan_step.group}] {result.reasoning}",
                     observation="",
+                    usage=result.usage,
                 )
-
                 await self._fire(OrchestratorEvent(
                     event_type="loop_select",
                     state=state,
                     step=plan_step,
                     iteration=iteration,
+                    usage=result.usage,
+                    cumulative_usage=specialist_cumulative,
                 ))
 
-                # ── Agent 3: Execute ─────────────────────────────────────
-                observation = await self._executor.execute(tool_name, tool_args)
+                observation = await self._executor.execute(result.tool_name, result.tool_args)
                 iteration.observation = observation
-
+                iteration.screenshot = pt._state.get("last_screenshot")
                 await self._fire(OrchestratorEvent(
                     event_type="loop_execute",
                     state=state,
                     step=plan_step,
                     iteration=iteration,
+                    cumulative_usage=self._total_usage,
                 ))
-
-                # Add to step history so evaluator sees everything
                 plan_step.iterations.append(iteration)
 
-                # ── Agent 4: Evaluate ────────────────────────────────────
-                eval_status, eval_reason, eval_answer = await self._evaluator.evaluate(
-                    plan_step.description,
-                    plan_step.all_observations,
-                    plan_step.all_tool_calls,
+                # Hard, non-LLM safety net — a model can never talk its way past this
+                hard_failed, hard_reason = _check_hard_stop(
+                    plan_step.all_tool_calls, plan_step.all_observations
                 )
-
-                iteration.eval_status = eval_status
-                iteration.eval_reason = eval_reason
-                iteration.eval_answer = eval_answer
-
-                await self._fire(OrchestratorEvent(
-                    event_type="loop_eval",
-                    state=state,
-                    step=plan_step,
-                    iteration=iteration,
-                ))
-
-                if eval_status == LoopStatus.DONE:
-                    plan_step.result = eval_answer
-                    plan_step.status = StepStatus.DONE
-                    step_done = True
-                    last_feedback = ""
+                if hard_failed:
+                    iteration.eval_status = LoopStatus.FAILED
+                    iteration.eval_reason = hard_reason
                     await self._fire(OrchestratorEvent(
-                        event_type="step_done",
+                        event_type="loop_eval",
                         state=state,
                         step=plan_step,
+                        iteration=iteration,
+                        cumulative_usage=self._total_usage,
                     ))
-
-                    # ── Early exit: check if the original task is already answered ──
-                    if i < len(state.plan) - 1:  # only if there are remaining steps
-                        complete, early_answer = await self._task_already_complete(
-                            state.original_task, state
-                        )
-                        if complete:
-                            logger.info("Task complete after step %d — skipping %d remaining steps",
-                                        plan_step.index, len(state.plan) - i - 1)
-                            # Mark remaining steps as skipped
-                            for remaining in state.plan[i + 1:]:
-                                remaining.status = StepStatus.SKIPPED
-                                remaining.result = "Skipped — task already complete."
-                            # Store the early answer and jump to summary
-                            if early_answer:
-                                plan_step.result = early_answer
-                            await self._fire(OrchestratorEvent(
-                                event_type="done",
-                                state=state,
-                                final_answer=early_answer or state.context_summary(),
-                            ))
-                            return early_answer or await self._build_summary(state)
-                    break
-
-                if eval_status == LoopStatus.FAILED:
-                    plan_step.error = eval_reason
                     plan_step.status = StepStatus.FAILED
-                    last_feedback = ""
+                    plan_step.error = hard_reason
                     await self._fire(OrchestratorEvent(
                         event_type="step_failed",
                         state=state,
                         step=plan_step,
+                        cumulative_usage=self._total_usage,
                     ))
                     break
 
-                # RETRY — thread feedback to next iteration
-                last_feedback = eval_reason
+                pending_iteration = iteration  # evaluated at the top of the next loop
 
-            if not step_done and plan_step.status != StepStatus.FAILED:
-                # Exhausted retries without a DONE verdict
-                plan_step.status = StepStatus.FAILED
-                plan_step.error = f"Max retries ({self._max_retries}) reached without completion."
-                await self._fire(OrchestratorEvent(
-                    event_type="step_failed",
-                    state=state,
-                    step=plan_step,
-                ))
+            # ── Replan: regenerate the remaining plan from live state ──────
+            finished_so_far = [
+                s for s in state.plan[: i + 1]
+                if s.status in (StepStatus.DONE, StepStatus.FAILED)
+            ]
+            live_state = await self._live_state_summary()
+            remaining_steps, replan_reasoning, replan_usage = await self._planner.plan_next(
+                task, finished_so_far, live_state
+            )
+            logger.info("Replan after step %d: %s", plan_step.index, replan_reasoning)
+
+            next_index = plan_step.index + 1
+            state.plan = state.plan[: i + 1] + [
+                PlanStep(index=next_index + j, description=desc, group=group)
+                for j, (desc, group) in enumerate(remaining_steps)
+            ]
+            await self._fire(OrchestratorEvent(
+                event_type="plan", state=state,
+                usage=replan_usage, cumulative_usage=self._track(replan_usage),
+            ))
+
+            i += 1
+
+        if i >= self._max_total_steps and i < len(state.plan):
+            logger.warning("Reached max_total_steps (%d) — stopping with partial results.",
+                           self._max_total_steps)
 
         # ── Phase 4: Stop browser ─────────────────────────────────────────
         if pt._state["browser"] is not None:
             await pt.stop_browser()
 
         # ── Phase 5: Final summary ───────────────────────────────────────
-        final_answer = await self._build_summary(state)
+        final_answer, summary_usage = await self._build_summary(state)
 
         await self._fire(OrchestratorEvent(
             event_type="done",
             state=state,
             final_answer=final_answer,
+            usage=summary_usage,
+            cumulative_usage=self._track(summary_usage),
         ))
 
         return final_answer
 
-    async def _build_summary(self, state: TaskState) -> str:
-        """One final LLM call to synthesise all step results into an answer."""
+    async def _build_summary(self, state: TaskState) -> tuple[str, dict]:
+        """One final LLM call to synthesise all step results into an answer.
+        Returns (answer, usage) — usage is this one call's token count."""
         lines = [f"Original task:\n{state.original_task}\n\nStep results:"]
         for s in state.plan:
             lines.append(f"\nStep {s.index}: {s.description}")
@@ -1297,7 +1305,7 @@ class OrchestratorAgent:
             system=self._SUMMARY_SYSTEM,
         )
         blocks = response["output"]["message"].get("content", [])
-        return _extract_text(blocks)
+        return _extract_text(blocks), usage_from_response(response)
 
 
 # ===========================================================================

@@ -41,6 +41,7 @@ from orchestrator import (
     OrchestratorAgent, OrchestratorEvent,
     StepStatus, LoopStatus, LoopIteration, PlanStep,
 )
+from guided_agent import DeliberationConfig, GuidedAgent, GuidedEvent
 
 # ── page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Playwright Agent", page_icon="🎭",
@@ -57,6 +58,10 @@ st.markdown("""
 .tag-obs    { background:#dcfce7; color:#166534; }
 .tag-select { background:#dbeafe; color:#1d4ed8; }
 .tag-eval   { background:#fef9c3; color:#854d0e; }
+.tag-goal   { background:#ede9fe; color:#6d28d9; }
+.tag-veto   { background:#fee2e2; color:#b91c1c; }
+.tag-pass   { background:#dcfce7; color:#166534; }
+.tag-warn   { background:#fef3c7; color:#92400e; }
 .eval-done  { color:#27ae60; font-weight:600; }
 .eval-retry { color:#e67e22; font-weight:600; }
 .eval-failed{ color:#e74c3c; font-weight:600; }
@@ -67,9 +72,24 @@ st.markdown("""
 for k, v in {
     "running": False, "steps": [], "final_answer": "",
     "q": None, "error": "", "mode": "react", "task_status": None,
+    # Text streamed from the LLM turn currently in flight. Rendered below the
+    # finished steps and cleared the moment that turn lands as a real step.
+    "live": "",
+    "notice": "",   # sticky infrastructure message, e.g. "streaming unavailable"
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+def _reset_output_state() -> None:
+    """Clear prior run output so each new task starts from a clean UI."""
+    st.session_state.steps = []
+    st.session_state.final_answer = ""
+    st.session_state.error = ""
+    st.session_state.task_status = None
+    st.session_state.live = ""
+    st.session_state.notice = ""
+    st.session_state.q = None
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -85,19 +105,24 @@ with st.sidebar:
     st.subheader("Mode")
     mode = st.radio(
         "Agent mode",
-        ["ReAct (recommended)", "Orchestrator"],
+        ["ReAct (recommended)", "Orchestrator", "Guided"],
         index=0,
-        help="ReAct: single agent, full history. Orchestrator: multi-agent decomposition.",
+        help=(
+            "ReAct: single agent, full history. "
+            "Orchestrator: plans steps then a per-group specialist executes each. "
+            "Guided: a thinking agent (search/structure only) decides one action at a "
+            "time, a separate actor agent executes it — no upfront plan."
+        ),
     )
     use_orchestrate = mode == "Orchestrator"
+    use_guided = mode == "Guided"
 
     st.divider()
     st.subheader("Model")
     _opts = [
         "amazon.nova-pro-v1:0",
-        "amazon.nova-2-lite-v1:0",
-        "anthropic.claude-sonnet-4-6:20250514-v1:0",
-        "anthropic.claude-haiku-4-5:20251001-v1:0",
+        "us.amazon.nova-2-lite-v1:0",
+        "us.anthropic.claude-haiku-4-5:20251001-v1:0",
     ]
     _default = _env("BEDROCK_MODEL_ID", _opts[0])
     _idx = _opts.index(_default) if _default in _opts else 0
@@ -116,7 +141,64 @@ with st.sidebar:
     max_iters  = st.slider("Max iterations", 5, 40, _env_int("MAX_RETRIES_PER_STEP", 20))
     max_tokens = st.slider("Max tokens", 512, 8192, _env_int("MAX_TOKENS", 4096), step=256)
     temperature = st.slider("Temperature", 0.0, 1.0, _env_float("TEMPERATURE", 0.0), step=0.05)
+    enable_reasoning = st.checkbox(
+        "Enable extended reasoning", value=False,
+        help="Turns on model 'thinking' in every mode. The right Bedrock key and "
+             "shape is chosen from the model ID (Claude uses 'thinking', Nova uses "
+             "'reasoning_config'), so you don't have to match it by hand. Claude also "
+             "requires temperature=1 while thinking, which is applied automatically. "
+             "When it works, each step shows a THINK box above the action.",
+    )
+    reasoning_budget = st.slider(
+        "Reasoning budget (tokens)", 1024, 8192, 2048, step=256,
+        disabled=not enable_reasoning,
+        help="Must be less than Max tokens — it is clamped into the model's legal "
+             "range automatically, and reasoning is skipped with a warning if Max "
+             "tokens leaves no room for it.",
+    )
+    # Guided-mode only: these layers live in the ThinkingAgent, which the other
+    # two modes don't have. Defaults still defined for every mode so cfg is uniform.
+    deliberate, vote_k, use_critic = True, 1, False
+    if use_guided:
+        st.divider()
+        st.subheader("Deliberation")
+        st.caption(
+            "Rebuilds in code the weighing-up that large reasoning models do "
+            "natively. The first is free; the other two multiply cost per action."
+        )
+        deliberate = st.checkbox(
+            "Force candidate comparison + outcome prediction", value=True,
+            help="Makes decide_action's schema demand at least two weighed candidates "
+                 "and a prediction of what the action will do. The prediction is then "
+                 "checked against the real page in code, and any mismatch is fed back. "
+                 "No extra LLM calls.",
+        )
+        vote_k = st.slider(
+            "Self-consistency samples", 1, 5, 1,
+            help="Sample each decision this many times and take the majority target. "
+                 "1 disables it. Costs roughly this many times the decision step, and "
+                 "raises the thinking temperature to 0.7 so the samples actually differ.",
+        )
+        use_critic = st.checkbox(
+            "Critic pass before each action", value=False,
+            help="A second agent argues the chosen action is wrong before it runs; a "
+                 "veto sends it back once. Adds one LLM call per action.",
+        )
+
+    st.divider()
     headless   = st.checkbox("Headless browser", value=_env_bool("HEADLESS", True))
+    show_raw   = st.checkbox("Show full tool output (raw JSON)", value=False,
+                              help="Off: each tool call shows a one-line summary, like a live "
+                                   "console. On: shows the full JSON result under each call.")
+    show_screenshots = st.checkbox("Show screenshots", value=True,
+                                    help="Show a screenshot of the page after each tool call.")
+    show_cursor = st.checkbox("Draw mouse pointer", value=True,
+                              help="Draw a fake mouse pointer into the page and move it onto "
+                                   "the element each action targets, so the screenshots show "
+                                   "where the agent clicked or typed. Adds ~0.3s per action.")
+    stream_output = st.checkbox("Stream model output", value=True,
+                                help="Show thinking and tool calls token by token as the model "
+                                     "produces them, instead of only when each turn completes.")
 
     st.divider()
     with st.expander("Registered tools"):
@@ -151,10 +233,7 @@ with col_run:
                         use_container_width=True)
 with col_clear:
     if st.button("✕  Clear", disabled=st.session_state.running):
-        st.session_state.steps = []
-        st.session_state.final_answer = ""
-        st.session_state.error = ""
-        st.session_state.task_status = None
+        _reset_output_state()
         st.rerun()
 
 
@@ -172,13 +251,68 @@ def _fmt(raw: str) -> str:
 def _trunc(s: str, n: int = 200) -> str:
     return s if len(s) <= n else s[:n] + " [...]"
 
+def _obs_summary(raw: str, n: int = 160) -> str:
+    """Condense a tool observation into one line for the streaming log view."""
+    try:
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return _trunc(str(obj), n)
+        if obj.get("error"):
+            return f"error: {_trunc(str(obj['error']), n)}"
+        for key in ("answer", "text", "value", "title", "url", "checked", "selected", "status"):
+            if obj.get(key):
+                return _trunc(f"{key}: {obj[key]}", n)
+        display = {k: v for k, v in obj.items()
+                   if k not in ("html", "page_html", "elements", "structure")}
+        return _trunc(json.dumps(display, ensure_ascii=False), n) if display else "ok"
+    except Exception:
+        return _trunc(raw, n)
+
+
+def _fmt_usage(usage: dict) -> str:
+    """Compact one-line token count for a single LLM call/running total."""
+    u = usage or {}
+    return (f"in={u.get('input_tokens', 0)} out={u.get('output_tokens', 0)} "
+            f"total={u.get('total_tokens', 0)}")
+
+
+def _usage_caption(usage: dict) -> None:
+    """Small caption showing the token cost of the LLM call behind one line."""
+    if usage:
+        st.caption(f"🔢 {_fmt_usage(usage)}")
+
 
 # ── background runners ────────────────────────────────────────────────────────
+
+def _make_delta_pusher(cfg: dict, q: queue.Queue):
+    """
+    on_delta callback that forwards each streamed chunk to the render queue,
+    or None when streaming is switched off.
+
+    Bedrock's event stream is drained on a boto3 worker thread, so this is
+    called off both the Streamlit thread and the agent's thread — queue.Queue
+    is the safe hand-off (Streamlit session state is not thread-safe).
+    """
+    if not cfg.get("stream"):
+        return None
+
+    def on_delta(kind: str, text: str) -> None:
+        q.put(("delta", (kind, text)))
+
+    return on_delta
+
+
+def _apply_browser_display_cfg(cfg: dict) -> None:
+    """Push the UI's cursor/screenshot preferences onto the tool layer's state."""
+    pt._state["show_cursor"] = bool(cfg.get("show_cursor", True))
+
 
 def _run_react(task: str, cfg: dict, q: queue.Queue) -> None:
     """Run PlaywrightAgent in a background thread, push ReActStep to queue."""
     def on_step(step: ReActStep):
         q.put(("react", step))
+
+    _apply_browser_display_cfg(cfg)
 
     async def _go():
         agent = PlaywrightAgent(
@@ -186,6 +320,8 @@ def _run_react(task: str, cfg: dict, q: queue.Queue) -> None:
             profile=cfg["profile"] or None,
             max_tokens=cfg["max_tokens"], temperature=cfg["temperature"],
             max_iterations=cfg["max_iters"], on_step=on_step,
+            reasoning_budget_tokens=cfg.get("reasoning_budget"),
+            on_delta=_make_delta_pusher(cfg, q),
         )
         try:
             return await agent.run(task)
@@ -206,12 +342,48 @@ def _run_orchestrator(task: str, cfg: dict, q: queue.Queue) -> None:
     def on_event(event: OrchestratorEvent):
         q.put(("orch", event))
 
+    _apply_browser_display_cfg(cfg)
+
     async def _go():
         agent = OrchestratorAgent(
             model_id=cfg["model_id"], region=cfg["region"],
             profile=cfg["profile"] or None,
             max_tokens=cfg["max_tokens"], temperature=cfg["temperature"],
             max_retries_per_step=cfg["max_iters"], on_event=on_event,
+            reasoning_budget_tokens=cfg.get("reasoning_budget"),
+            on_delta=_make_delta_pusher(cfg, q),
+        )
+        return await agent.run(task)
+
+    try:
+        asyncio.run(_go())
+    except Exception as exc:
+        q.put(exc)
+    finally:
+        q.put(None)
+
+
+def _run_guided(task: str, cfg: dict, q: queue.Queue) -> None:
+    """Run GuidedAgent in a background thread, push GuidedEvent to queue."""
+    def on_event(event: GuidedEvent):
+        q.put(("guided", event))
+
+    _apply_browser_display_cfg(cfg)
+
+    async def _go():
+        agent = GuidedAgent(
+            model_id=cfg["model_id"], region=cfg["region"],
+            profile=cfg["profile"] or None,
+            max_tokens=cfg["max_tokens"], temperature=cfg["temperature"],
+            max_iterations=cfg["max_iters"] * 5, on_event=on_event,
+            reasoning_budget_tokens=cfg.get("reasoning_budget"),
+            on_delta=_make_delta_pusher(cfg, q),
+            deliberation=DeliberationConfig(
+                forced_schema=cfg.get("deliberate", True),
+                predict_verify=cfg.get("deliberate", True),
+                self_consistency_k=cfg.get("vote_k", 1),
+                critic=cfg.get("critic", False),
+            ),
         )
         return await agent.run(task)
 
@@ -226,16 +398,18 @@ def _run_orchestrator(task: str, cfg: dict, q: queue.Queue) -> None:
 # ── trigger ───────────────────────────────────────────────────────────────────
 if run_btn and task_input.strip():
     st.session_state.running = True
-    st.session_state.steps   = []
-    st.session_state.final_answer = ""
-    st.session_state.error   = ""
-    st.session_state.mode    = "orch" if use_orchestrate else "react"
+    _reset_output_state()
+    st.session_state.mode    = "guided" if use_guided else ("orch" if use_orchestrate else "react")
 
     q: queue.Queue = queue.Queue()
     st.session_state.q = q
     cfg = dict(model_id=model_id, region=region, profile=profile,
-               max_tokens=max_tokens, temperature=temperature, max_iters=max_iters)
-    runner = _run_orchestrator if use_orchestrate else _run_react
+               max_tokens=max_tokens, temperature=temperature, max_iters=max_iters,
+               reasoning=enable_reasoning,
+               reasoning_budget=(reasoning_budget if enable_reasoning else None),
+               deliberate=deliberate, vote_k=vote_k, critic=use_critic,
+               show_cursor=show_cursor, stream=stream_output)
+    runner = _run_guided if use_guided else (_run_orchestrator if use_orchestrate else _run_react)
     threading.Thread(target=runner, args=(task_input, cfg, q), daemon=True).start()
     st.rerun()
 
@@ -266,6 +440,22 @@ if st.session_state.running and st.session_state.q:
             break
 
         kind, payload = item
+        if kind == "delta":
+            # A chunk of the turn in flight. Tool arguments arrive as JSON
+            # fragments, so they're appended raw and only become a rendered
+            # ACT line once the turn completes and lands as a step below.
+            delta_kind, text = payload
+            if delta_kind == "notice":
+                # Infrastructure message (e.g. streaming not permitted for this
+                # model), not model output — keep it after the run, unlike `live`.
+                st.session_state.notice = text
+            elif delta_kind == "tool":
+                st.session_state.live += f"\n▸ {text}("
+            else:
+                st.session_state.live += text
+            continue
+        # Any structured item means the streamed turn is now rendered properly.
+        st.session_state.live = ""
         if kind == "react":
             step: ReActStep = payload
             if step.final:
@@ -282,128 +472,211 @@ if st.session_state.running and st.session_state.q:
                 st.session_state.task_status = "pass" if failed < total else "fail"
                 done = True
             new_items.append(("orch", event))
+        elif kind == "guided":
+            event: GuidedEvent = payload
+            if event.event_type == "done":
+                st.session_state.final_answer = event.final_answer
+                st.session_state.task_status  = "pass"
+                done = True
+            elif event.event_type == "failed":
+                st.session_state.final_answer = event.final_answer
+                st.session_state.task_status  = "fail"
+                done = True
+            new_items.append(("guided", event))
 
     st.session_state.steps.extend(new_items)
     if done:
         st.session_state.running = False
         st.session_state.q = None
-    else:
-        time.sleep(0.2)
-        st.rerun()
+        st.session_state.live = ""
+    # Deliberately NO st.rerun() here. It raises RerunException, which aborts
+    # the script on the spot — rerunning from this point meant the render block
+    # below was never reached while the agent was running, so the whole trace
+    # appeared in one lump at the end instead of a step at a time. The refresh
+    # now happens at the very bottom of the file, after rendering.
 
-    if not done:
-        st.rerun()
 
-
-# ── render ────────────────────────────────────────────────────────────────────
-if st.session_state.running:
-    st.info("⏳ Agent is running…", icon="🔄")
-
+# ── render — live streaming tool-call feed ─────────────────────────────────────
 steps = st.session_state.steps
+_MODE_LABEL = {"react": "ReAct", "orch": "Orchestrator", "guided": "Guided"}
 
-if steps:
-    st.divider()
+if steps or st.session_state.running:
+    mode_label = _MODE_LABEL.get(st.session_state.mode, "Agent")
 
-    if st.session_state.mode == "react":
-        # ── ReAct view ────────────────────────────────────────────────────
-        st.caption(f"Mode: ReAct — {len([s for _, s in steps if not s.final])} tool calls")
-        for _, step in steps:
-            if step.final:
-                continue
-            with st.expander(
-                f"Step {step.iteration} — `{step.tool_name}`",
-                expanded=(step.iteration == len(steps) - 1),
-            ):
-                if step.thought:
-                    st.markdown(
-                        f'<span class="tag tag-think">THINK</span> {html_lib.escape(_trunc(step.thought))}',
-                        unsafe_allow_html=True,
-                    )
-                args_str = html_lib.escape(_trunc(json.dumps(step.tool_input, ensure_ascii=False), 160))
+    if st.session_state.running:
+        status_state, status_label = "running", f"🔄 {mode_label} agent running…"
+    elif st.session_state.error:
+        status_state, status_label = "error", "✗ Error"
+    elif st.session_state.task_status == "pass":
+        status_state, status_label = "complete", "✓ Task completed"
+    elif st.session_state.task_status == "fail":
+        status_state, status_label = "error", "✗ Task incomplete"
+    else:
+        status_state, status_label = "complete", f"{mode_label} agent"
+
+    # Auto-collapse only on a clean success — stay open while running or on error/incomplete.
+    expanded = st.session_state.running or status_state != "complete"
+
+    # ── running token total, read off the last event's cumulative_usage ────
+    running_usage = {}
+    for _, item in reversed(steps):
+        u = getattr(item, "cumulative_usage", None)
+        if u:
+            running_usage = u
+            break
+    tok_cols = st.columns(3)
+    tok_cols[0].metric("Input tokens", running_usage.get("input_tokens", 0))
+    tok_cols[1].metric("Output tokens", running_usage.get("output_tokens", 0))
+    tok_cols[2].metric("Total tokens", running_usage.get("total_tokens", 0))
+
+    def _act_line(tag_cls: str, label: str, tool_name: str, args: dict, n: int = 120) -> None:
+        args_str = html_lib.escape(_trunc(json.dumps(args, ensure_ascii=False), n))
+        st.markdown(
+            f'<span class="tag {tag_cls}">{label}</span> <code>{tool_name}({args_str})</code>',
+            unsafe_allow_html=True,
+        )
+
+    def _obs_line(observation: str, screenshot: bytes = None) -> None:
+        if observation:
+            if show_raw:
+                st.markdown(f'<div class="obs-box">{_fmt(observation)}</div>', unsafe_allow_html=True)
+            else:
                 st.markdown(
-                    f'<span class="tag tag-act">ACT</span> <code>{step.tool_name}({args_str})</code>',
+                    f'<span class="tag tag-obs">→</span> {html_lib.escape(_obs_summary(observation))}',
                     unsafe_allow_html=True,
                 )
-                if step.observation:
-                    st.markdown('<span class="tag tag-obs">OBS</span>', unsafe_allow_html=True)
+        if show_screenshots and screenshot:
+            st.image(screenshot, width=320)
+
+    if st.session_state.notice:
+        st.caption(f"ℹ️ {st.session_state.notice}")
+
+    with st.status(status_label, state=status_state, expanded=expanded):
+        if st.session_state.mode == "react":
+            # ── ReAct: one tool call after another, in the order they happened ──
+            for _, step in steps:
+                if step.final:
+                    continue
+                if step.reasoning:
                     st.markdown(
-                        f'<div class="obs-box">{_fmt(step.observation)}</div>',
+                        f'<span class="tag tag-think">THINK</span> '
+                        f'{html_lib.escape(_trunc(step.reasoning, 400))}',
                         unsafe_allow_html=True,
                     )
-                if step.prompt_sent:
-                    with st.expander("📨 Prompt sent to model", expanded=False):
-                        st.code(step.prompt_sent, language="text")
+                if step.thought:
+                    st.caption(_trunc(step.thought, 160))
+                _act_line("tag-act", "ACT", step.tool_name, step.tool_input)
+                _obs_line(step.observation, step.screenshot)
+                _usage_caption(step.usage)
 
-    else:
-        # ── Orchestrator view ─────────────────────────────────────────────
-        orch_events = [e for k, e in steps if k == "orch"]
+        elif st.session_state.mode == "orch":
+            # ── Orchestrator: plan, then every select/execute/eval as it streams ──
+            orch_events = [e for k, e in steps if k == "orch"]
+            for e in orch_events:
+                if e.event_type == "plan":
+                    st.markdown(f"**📋 Plan — {len(e.state.plan)} step(s)**")
+                    for s in e.state.plan:
+                        st.caption(f"{s.index}. {s.description}  ({s.group})")
+                    _usage_caption(e.usage)
+                elif e.event_type == "step_start":
+                    st.markdown(f"---\n**▶ Subtask {e.step.index}: {e.step.description}**")
+                elif e.event_type == "loop_select":
+                    it = e.iteration
+                    _act_line("tag-select", "ACT", it.tool_name, it.tool_args)
+                    if it.selection_reasoning:
+                        st.caption(_trunc(it.selection_reasoning, 140))
+                    _usage_caption(e.usage)
+                elif e.event_type == "loop_execute":
+                    _obs_line(e.iteration.observation, e.iteration.screenshot)
+                elif e.event_type == "loop_eval":
+                    it = e.iteration
+                    ecls  = {"done": "eval-done", "retry": "eval-retry", "failed": "eval-failed"}.get(it.eval_status.value, "")
+                    eicon = {"done": "✓", "retry": "↺", "failed": "✗"}.get(it.eval_status.value, "?")
+                    st.markdown(
+                        f'<span class="tag tag-eval">EVAL</span> <span class="{ecls}">{eicon} {it.eval_status.value.upper()}</span>'
+                        f' — {html_lib.escape(_trunc(it.eval_reason, 120))}',
+                        unsafe_allow_html=True,
+                    )
+                    _usage_caption(e.usage)
+                elif e.event_type == "step_done":
+                    st.markdown(f"✓ **Subtask {e.step.index} done** — {_trunc(e.step.result, 140)}")
+                elif e.event_type == "step_failed":
+                    st.markdown(f"✗ **Subtask {e.step.index} failed** — {_trunc(e.step.error, 140)}")
 
-        plan_event = next((e for e in orch_events if e.event_type == "plan"), None)
-        if plan_event:
-            with st.expander("📋 Plan", expanded=True):
-                for s in plan_event.state.plan:
-                    latest = s.status
-                    for e in reversed(orch_events):
-                        if e.step and e.step.index == s.index:
-                            latest = e.step.status
-                            break
-        icon = {StepStatus.DONE: "✓", StepStatus.FAILED: "✗",
-                StepStatus.RUNNING: "▶", StepStatus.PENDING: "○",
-                StepStatus.SKIPPED: "⏭"}.get(latest, "○")
-                    st.markdown(f"{icon} **Step {s.index}** — {s.description}")
-
-        st.divider()
-
-        step_starts = [e for e in orch_events if e.event_type == "step_start"]
-        for se in step_starts:
-            ps = se.step
-            step_evs = [e for e in orch_events if e.step and e.step.index == ps.index]
-            done_ev   = next((e for e in step_evs if e.event_type == "step_done"), None)
-            failed_ev = next((e for e in step_evs if e.event_type == "step_failed"), None)
-            header_icon = "✓" if done_ev else ("✗" if failed_ev else "▶")
-
-            with st.expander(
-                f"{header_icon} Subtask {ps.index} — {ps.description}",
-                expanded=(not done_ev and not failed_ev),
-            ):
-                iters: dict = {}
-                for e in step_evs:
-                    if e.iteration is None: continue
-                    n = e.iteration.number
-                    if n not in iters: iters[n] = {}
-                    iters[n][e.event_type] = e.iteration
-
-                for n in sorted(iters):
-                    it = iters[n]
-                    sel = it.get("loop_select")
-                    exe = it.get("loop_execute")
-                    evl = it.get("loop_eval")
-                    st.markdown(f"**Loop {n}**")
-
-                    if sel:
-                        args_str = html_lib.escape(json.dumps(sel.tool_args, ensure_ascii=False)[:120])
+        else:
+            # ── Guided: LOOK / ACT / OBSERVE as it streams ──────────────────
+            guided_events = [e for k, e in steps if k == "guided"]
+            for e in guided_events:
+                if e.event_type == "perceive":
+                    _act_line("tag-goal", "LOOK", e.perceive_tool, e.perceive_args, n=100)
+                    _obs_line(e.perceive_observation)
+                elif e.event_type == "goal":
+                    st.markdown(f"---\n**🎯 {e.current_goal}**")
+                    if e.model_reasoning:
                         st.markdown(
-                            f'<span class="tag tag-select">SELECT</span> <code>{sel.tool_name}({args_str})</code>',
+                            f'<span class="tag tag-think">THINK</span> '
+                            f'{html_lib.escape(_trunc(e.model_reasoning, 400))}',
                             unsafe_allow_html=True,
                         )
-                        if sel.selection_reasoning:
-                            st.caption(_trunc(sel.selection_reasoning, 160))
-                    if exe and exe.observation:
-                        st.markdown('<span class="tag tag-obs">OBSERVE</span>', unsafe_allow_html=True)
-                        st.markdown(f'<div class="obs-box">{_fmt(exe.observation)}</div>', unsafe_allow_html=True)
-                    if evl:
-                        ecls = {"done": "eval-done", "retry": "eval-retry", "failed": "eval-failed"}.get(evl.eval_status.value, "")
-                        eicon = {"done": "✓", "retry": "↺", "failed": "✗"}.get(evl.eval_status.value, "?")
+                    # Deliberation surface — only populated when those layers are on.
+                    if e.options_considered:
+                        with st.expander(
+                            f"Weighed {len(e.options_considered)} candidates", expanded=False
+                        ):
+                            for o in e.options_considered:
+                                if not isinstance(o, dict):
+                                    continue
+                                st.markdown(
+                                    f"**`{o.get('ref', '?')}`** · score "
+                                    f"**{o.get('score', '?')}** — {o.get('label', '')}"
+                                )
+                                st.caption(
+                                    f"for: {o.get('supports', '—')}\n\n"
+                                    f"against: {o.get('against', '—')}"
+                                )
+                    if e.expected_outcome:
+                        predicted = []
+                        if e.expected_outcome.get("url_changes"):
+                            predicted.append("the URL changes")
+                        if e.expected_outcome.get("expect_text"):
+                            predicted.append(f"{e.expected_outcome['expect_text']!r} appears")
+                        if e.expected_outcome.get("target_should_vanish"):
+                            predicted.append("the target disappears")
+                        if predicted:
+                            st.caption("Predicts: " + ", ".join(predicted))
+                    _usage_caption(e.usage)
+                elif e.event_type == "critique":
+                    cls, label = ("tag-veto", "VETO") if e.veto else ("tag-pass", "PASS")
+                    st.markdown(
+                        f'<span class="tag {cls}">CRITIC {label}</span> '
+                        f'{html_lib.escape(_trunc(e.critique, 220))}',
+                        unsafe_allow_html=True,
+                    )
+                    _usage_caption(e.usage)
+                elif e.event_type == "act_select":
+                    _act_line("tag-select", "ACT", e.tool_name, e.tool_args)
+                    if e.reasoning:
+                        st.caption(_trunc(e.reasoning, 140))
+                    _usage_caption(e.usage)
+                elif e.event_type == "act_execute":
+                    _obs_line(e.observation, e.screenshot)
+                    if e.prediction_mismatch:
                         st.markdown(
-                            f'<span class="tag tag-eval">EVAL</span> <span class="{ecls}">{eicon} {evl.eval_status.value.upper()}</span> — {html_lib.escape(_trunc(evl.eval_reason, 120))}',
+                            f'<span class="tag tag-warn">PREDICTION</span> '
+                            f'{html_lib.escape(_trunc(e.prediction_mismatch.strip(), 260))}',
                             unsafe_allow_html=True,
                         )
-                    st.markdown("---")
 
-                if done_ev:
-                    st.success(f"✓ {done_ev.step.result}")
-                elif failed_ev:
-                    st.error(f"✗ {failed_ev.step.error}")
+        # ── the turn currently in flight, streamed token by token ───────────
+        # Shown after the finished steps and replaced by a proper step entry as
+        # soon as this turn lands, so nothing is rendered twice. Only the tail
+        # is kept: a long thinking block would otherwise push the trace off screen.
+        if st.session_state.live:
+            st.markdown(
+                f'<span class="tag tag-think">LIVE</span> '
+                f'{html_lib.escape(st.session_state.live[-1200:])}▍',
+                unsafe_allow_html=True,
+            )
 
 
 # ── final answer & task status ───────────────────────────────────────────────
@@ -454,6 +727,20 @@ if ran and not st.session_state.running:
     elif not st.session_state.error:
         st.warning("No final answer was produced.")
 
+    # ── total token usage for the whole run ────────────────────────────────
+    final_usage = {}
+    for _, item in reversed(steps):
+        u = getattr(item, "cumulative_usage", None)
+        if u:
+            final_usage = u
+            break
+    if final_usage:
+        st.markdown("**Total tokens used**")
+        u1, u2, u3 = st.columns(3)
+        u1.metric("Input tokens", final_usage.get("input_tokens", 0))
+        u2.metric("Output tokens", final_usage.get("output_tokens", 0))
+        u3.metric("Total tokens", final_usage.get("total_tokens", 0))
+
     # ── stats ─────────────────────────────────────────────────────────────
     if st.session_state.mode == "orch":
         orch_events = [e for k, e in steps if k == "orch"]
@@ -488,6 +775,20 @@ if ran and not st.session_state.running:
             step_evs = [e for e in orch_events if e.event_type in ("step_done", "step_failed")]
             if step_evs:
                 st.caption(f"{sum(1 for e in step_evs if e.event_type == 'step_done')} steps completed before stop.")
+    elif st.session_state.mode == "guided":
+        guided = [e for k, e in steps if k == "guided"]
+        n       = sum(1 for e in guided if e.event_type == "act_execute")
+        vetoes  = sum(1 for e in guided if e.event_type == "critique" and e.veto)
+        misses  = sum(1 for e in guided if e.prediction_mismatch)
+        if n or vetoes or misses:
+            bits = [f"{n} tool call{'s' if n != 1 else ''} made."]
+            if vetoes:
+                bits.append(f"{vetoes} action{'s' if vetoes != 1 else ''} vetoed by the critic.")
+            if misses:
+                bits.append(
+                    f"{misses} prediction{'s' if misses != 1 else ''} did not match the page."
+                )
+            st.caption(" ".join(bits))
     else:
         tool_steps = [s for _, s in steps if not s.final]
         n = len(tool_steps)
@@ -501,3 +802,12 @@ elif not ran and not st.session_state.running:
         '<p>Enter a task above and click <b>Run</b>.</p></div>',
         unsafe_allow_html=True,
     )
+
+
+# ── live refresh ──────────────────────────────────────────────────────────────
+# Must be the LAST thing in the script: st.rerun() aborts the run immediately,
+# so anything after it never renders. Reaching here means the trace above has
+# been drawn, and we can safely poll the queue again for the next tool call.
+if st.session_state.running:
+    time.sleep(0.2)
+    st.rerun()

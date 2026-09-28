@@ -25,7 +25,28 @@
       "ytd-video-primary-info-renderer #view-count",
       "yt-formatted-string#video-title",
       "ytd-video-primary-info-renderer yt-formatted-string#title",
-      "h1#title"
+      "h1#title",
+      "input[name=\\\"search_query\\\"]",
+      "button[aria-label=\\\"Search\\\"]",
+      "ytd-video-renderer #metadata-line span:nth-child(1)",
+      "ytd-video-renderer #metadata-line span:nth-child(2)",
+      "ytd-player-overlay-video-details-renderer span[role='text']:nth-child(2)",
+      "ytd-video-primary-info-renderer div#metadata-line span:nth-child(2)",
+      "yt-player-overlay-video-details-renderer span[role='text']:nth-child(2)",
+      "ytd-video-primary-info-renderer span[aria-label^=\"Views\"]",
+      "ytd-video-primary-info-renderer div#metadata-line span[aria-label^=\"Views\"]",
+      "ytd-video-primary-info-renderer div#metadata-line span:nth-child(1)",
+      "ytd-video-primary-info-renderer div#metadata-line span",
+      "ytd-video-primary-info-renderer yt-formatted-string#view-count",
+      "yt-player-overlay-video-details-renderer div span[role='text']:nth-child(2)",
+      "yt-formatted-string[aria-label*=\"views\"]",
+      "ytd-player-overlay-video-details-renderer",
+      "yt-formatted-string[aria-label=\"Views\"]",
+      "[aria-ref=e35]",
+      "[aria-ref=e120]",
+      "[aria-ref=e34]",
+      "[aria-ref=e2139]",
+      "button#skip-button\\:2"
     ]
   },
   "www.workday.com": {
@@ -40,7 +61,58 @@
       "button[aria-label='Apply Now']",
       "input[type='text']",
       "button[aria-label='Apply']",
-      "input[name='q']"
+      "input[name='q']",
+      "button:has-text(\"Apply\")"
+    ]
+  },
+  "www.wikipedia.org": {
+    "working": {
+      "input_field": "input#searchInput"
+    },
+    "failed": []
+  },
+  "en.wikipedia.org": {
+    "working": {},
+    "failed": [
+      "#mw-content-text h2:has-text('History') + div",
+      "h2:has-text(\"History\") + div",
+      "#mw-content-text h2:has-text('History') + div a"
+    ]
+  },
+  "www.amazon.in": {
+    "working": {
+      "input_field": "input#twotabsearchtextbox"
+    },
+    "failed": [
+      "Mobiles",
+      "[aria-ref=e90]"
+    ]
+  },
+  "about:blank": {
+    "working": {
+      "input_field": "#q"
+    },
+    "failed": []
+  },
+  "news.ycombinator.com": {
+    "working": {},
+    "failed": [
+      "button#does-not-exist",
+      "h1#nope"
+    ]
+  },
+  "demovalidation.softeon.com": {
+    "working": {},
+    "failed": [
+      "[aria-ref=f2e11]",
+      "[aria-ref=f2e14]",
+      "#signInBtn",
+      "[aria-ref=f2e15]",
+      "#txtUserId",
+      "[aria-ref=f5e11]",
+      "[aria-ref=f5e14]",
+      "[aria-ref=f8e11]",
+      "button:has-text(\"SIGN IN\")"
     ]
   }
 }

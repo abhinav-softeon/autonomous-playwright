@@ -3,12 +3,17 @@ Entry point — Playwright Browser Agent (AWS Bedrock)
 
 Default: single-agent ReAct loop (PlaywrightAgent) — one growing message list,
          all 60 tools available, full context every turn.
---orchestrate: multi-agent pipeline (DecompositionAgent + ToolSpecialistAgent + EvaluationAgent)
+--orchestrate: multi-agent pipeline (PlanningAgent + SpecialistAgent, per-group tool selection + self-evaluation)
+--guided: ThinkingAgent (read-only search/structure, decides one action at a time) +
+          ActorAgent (translates that action into an exact tool call) — tighter,
+          per-action loop than --orchestrate, closer to ReAct's granularity but
+          split across two LLM roles instead of one.
 
 Run:
     python main.py
     python main.py --task "Go to youtube.com, search 'github tutorial', return the first video name and view count."
     python main.py --orchestrate --task "..."
+    python main.py --guided --task "..."
     python main.py --model "amazon.nova-pro-v1:0" --region "us-west-2" --no-headless
     python main.py --list-tools
 """
@@ -18,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+from typing import Optional
 
 import playwright_tools as pt
 from llm_agent import PlaywrightAgent, ReActStep, get_all_tool_schemas
@@ -29,6 +35,7 @@ from orchestrator import (
     LoopIteration,
     PlanStep,
 )
+from guided_agent import DeliberationConfig, GuidedAgent, GuidedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,13 @@ _DOUBLE   = "═" * _W
 
 def _truncate(text: str, n: int = 300) -> str:
     return text if len(text) <= n else text[:n] + " [...]"
+
+
+def _fmt_usage(usage: dict) -> str:
+    """Compact one-line token count for a single LLM call."""
+    u = usage or {}
+    return (f"in={u.get('input_tokens', 0)} out={u.get('output_tokens', 0)} "
+            f"total={u.get('total_tokens', 0)}")
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +94,7 @@ def on_event(event: OrchestratorEvent) -> None:
         print(_DOUBLE)
         for s in event.state.plan:
             print(f"  {s.index:>2}.  {s.description}")
+        print(f"  [tokens: {_fmt_usage(event.usage)}  |  running total: {_fmt_usage(event.cumulative_usage)}]")
         print()
 
     # ── Starting a new subtask ───────────────────────────────────────────
@@ -99,6 +114,7 @@ def on_event(event: OrchestratorEvent) -> None:
         print(f"  SELECT   {it.tool_name}({args_str})")
         if it.selection_reasoning:
             print(f"  REASON   {_truncate(it.selection_reasoning, 120)}")
+        print(f"  [tokens: {_fmt_usage(event.usage)}  |  running total: {_fmt_usage(event.cumulative_usage)}]")
 
     # ── Agent 3 executed the tool ────────────────────────────────────────
     elif event.event_type == "loop_execute":
@@ -113,6 +129,7 @@ def on_event(event: OrchestratorEvent) -> None:
         print(f"  EVAL     {icon} {status_label}  —  {_truncate(it.eval_reason, 120)}")
         if it.eval_status == LoopStatus.DONE and it.eval_answer:
             print(f"  ANSWER   {_truncate(it.eval_answer, 200)}")
+        print(f"  [tokens: {_fmt_usage(event.usage)}  |  running total: {_fmt_usage(event.cumulative_usage)}]")
 
     # ── Subtask completed ────────────────────────────────────────────────
     elif event.event_type == "step_done":
@@ -141,6 +158,7 @@ def on_event(event: OrchestratorEvent) -> None:
             print(f"  {s.index:<4} {label:<10} {_truncate(s.description, 44)}")
 
         print(f"\n  Total loops: {total_loops}  |  Total tool calls: {total_tools}")
+        print(f"  Total tokens: {_fmt_usage(event.cumulative_usage)}")
 
         print(f"\n{_DOUBLE}")
         print("  FINAL ANSWER")
@@ -159,6 +177,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--orchestrate", action="store_true", default=False,
         help="Use the multi-agent orchestrator instead of single-agent ReAct loop.",
+    )
+    parser.add_argument(
+        "--guided", action="store_true", default=False,
+        help="Use the guided ThinkingAgent+ActorAgent loop (per-action, not per-step planning).",
     )
     parser.add_argument(
         "--task",
@@ -203,10 +225,68 @@ def parse_args() -> argparse.Namespace:
         help="Max Select→Execute→Evaluate loops per subtask (default: 8).",
     )
     parser.add_argument(
+        "--reasoning",
+        action="store_true",
+        default=False,
+        help="Enable model reasoning/'thinking' in every mode. The correct Bedrock "
+             "key and shape is picked from the model ID (Claude: 'thinking', Nova: "
+             "'reasoning_config'), and Claude's temperature=1 requirement is applied "
+             "automatically.",
+    )
+    parser.add_argument(
+        "--reasoning-budget",
+        type=int,
+        default=2048,
+        help="Thinking budget in tokens when --reasoning is set (default: 2048). "
+             "Clamped into the model's legal range; must be under --max-tokens.",
+    )
+    parser.add_argument(
+        "--no-deliberation",
+        action="store_true",
+        default=False,
+        help="Guided mode: turn off the free deliberation layers (forced candidate "
+             "comparison and predict-then-verify), which are on by default.",
+    )
+    parser.add_argument(
+        "--vote",
+        type=int,
+        default=1,
+        metavar="K",
+        help="Guided mode: sample each decision K times and take the majority "
+             "target. Multiplies decision cost by K (default: 1, off).",
+    )
+    parser.add_argument(
+        "--critic",
+        action="store_true",
+        default=False,
+        help="Guided mode: have a second agent argue against each decision before "
+             "it runs. Adds one LLM call per action.",
+    )
+    parser.add_argument(
         "--no-headless",
         action="store_true",
         default=False,
         help="Show the browser window.",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        default=False,
+        help="Wait for each LLM turn to finish before printing it, instead of "
+             "echoing thinking and tool calls token by token as they arrive.",
+    )
+    parser.add_argument(
+        "--screenshot-dir",
+        default=None,
+        help="Save a numbered screenshot of the page after every tool call into "
+             "this directory (created if missing). The fake mouse pointer is "
+             "drawn on the element each action targeted.",
+    )
+    parser.add_argument(
+        "--no-cursor",
+        action="store_true",
+        default=False,
+        help="Don't draw the fake mouse pointer into the page.",
     )
     parser.add_argument(
         "--list-tools",
@@ -244,6 +324,9 @@ def print_react_step(step: ReActStep) -> None:
     print(_DIVIDER)
     if step.thought:
         print(f"  THINK  {_truncate(step.thought, 200)}")
+    if step.reasoning:
+        print(f"  REASON {_truncate(step.reasoning, 300)}")
+    print(f"  [tokens: {_fmt_usage(step.usage)}  |  running total: {_fmt_usage(step.cumulative_usage)}]")
     if step.final:
         print(f"\n  ANSWER {step.answer}")
         return
@@ -261,6 +344,43 @@ def print_react_step(step: ReActStep) -> None:
         print(f"  OBS\n{lines}")
 
 
+def make_delta_printer(args: argparse.Namespace):
+    """
+    Build the on_delta callback that echoes the model's output to stdout as it
+    is generated, or None when --no-stream was passed.
+
+    Called from the boto3 worker thread draining the event stream, so it does
+    nothing but write — the structured per-step summary still comes from the
+    on_step/on_event renderers once the turn is complete. Chunks are written
+    without a newline so text reads as one flowing paragraph; the leading
+    newline on the label makes each new block start on its own line.
+    """
+    if args.no_stream:
+        return None
+
+    state = {"kind": None}
+
+    def on_delta(kind: str, text: str) -> None:
+        if kind == "notice":
+            print(f"\n  NOTE   {text}", flush=True)
+            state["kind"] = None
+            return
+        if kind == "tool":
+            print(f"\n  ACT    {text}(", end="", flush=True)
+            state["kind"] = kind
+            return
+        if kind == "tool_input":
+            print(text, end="", flush=True)
+            return
+        if kind != state["kind"]:
+            label = "THINK " if kind == "reasoning" else "TEXT  "
+            print(f"\n  {label} ", end="", flush=True)
+            state["kind"] = kind
+        print(text, end="", flush=True)
+
+    return on_delta
+
+
 def build_react_agent(args: argparse.Namespace) -> PlaywrightAgent:
     return PlaywrightAgent(
         model_id=args.model,
@@ -270,7 +390,14 @@ def build_react_agent(args: argparse.Namespace) -> PlaywrightAgent:
         temperature=args.temperature,
         max_iterations=args.max_retries,
         on_step=print_react_step,
+        reasoning_budget_tokens=_reasoning_budget(args),
+        on_delta=make_delta_printer(args),
     )
+
+
+def _reasoning_budget(args: argparse.Namespace) -> Optional[int]:
+    """The thinking budget to request, or None when --reasoning is off."""
+    return args.reasoning_budget if args.reasoning else None
 
 
 def build_orchestrator(args: argparse.Namespace) -> OrchestratorAgent:
@@ -282,6 +409,71 @@ def build_orchestrator(args: argparse.Namespace) -> OrchestratorAgent:
         temperature=args.temperature,
         max_retries_per_step=args.max_retries,
         on_event=on_event,
+        reasoning_budget_tokens=_reasoning_budget(args),
+        on_delta=make_delta_printer(args),
+    )
+
+
+def print_guided_event(event: GuidedEvent) -> None:
+    if event.event_type == "perceive":
+        args_str = _truncate(json.dumps(event.perceive_args, ensure_ascii=False), 120)
+        print(f"  LOOK   {event.perceive_tool}({args_str})")
+        try:
+            obj = json.loads(event.perceive_observation)
+            display = {k: v for k, v in obj.items() if k not in ("html", "page_html", "structure")}
+            print(f"         {_truncate(json.dumps(display, ensure_ascii=False), 300)}")
+        except Exception:
+            print(f"         {_truncate(event.perceive_observation, 300)}")
+    elif event.event_type == "goal":
+        print(f"\n{_HEAVY}")
+        print(f"  ITER {event.iteration}  GOAL: {event.current_goal}")
+        print(_HEAVY)
+        if event.model_reasoning:
+            print(f"  THINK  {_truncate(event.model_reasoning, 400)}")
+        for o in event.options_considered:
+            if isinstance(o, dict):
+                print(f"  OPT    {o.get('ref', '?')} score={o.get('score', '?')} "
+                      f"— {_truncate(str(o.get('label', '')), 60)}")
+        print(f"  [tokens: {_fmt_usage(event.usage)}  |  running total: {_fmt_usage(event.cumulative_usage)}]")
+    elif event.event_type == "act_select":
+        args_str = _truncate(json.dumps(event.tool_args, ensure_ascii=False), 160)
+        print(f"  ACT    {event.tool_name}({args_str})")
+        if event.reasoning:
+            print(f"  REASON {_truncate(event.reasoning, 120)}")
+        print(f"  [tokens: {_fmt_usage(event.usage)}  |  running total: {_fmt_usage(event.cumulative_usage)}]")
+    elif event.event_type == "critique":
+        verdict = "VETO" if event.veto else "PASS"
+        print(f"  CRITIC {verdict}  {_truncate(event.critique, 200)}")
+    elif event.event_type == "act_execute":
+        print(f"  OBSERVE\n{_obs_str(event.observation)}")
+        if event.prediction_mismatch:
+            print(f"  ⚠ {_truncate(event.prediction_mismatch.strip(), 300)}")
+    elif event.event_type == "done":
+        print(f"\n{_DOUBLE}\n  DONE\n{_DOUBLE}")
+        print(f"\n  ANSWER {event.final_answer}")
+        print(f"\n  Total tokens: {_fmt_usage(event.cumulative_usage)}")
+    elif event.event_type == "failed":
+        print(f"\n  ✗ {event.final_answer}")
+        print(f"  Total tokens: {_fmt_usage(event.cumulative_usage)}")
+
+
+def build_guided_agent(args: argparse.Namespace) -> GuidedAgent:
+    return GuidedAgent(
+        model_id=args.model,
+        region=args.region,
+        profile=args.profile,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        max_iterations=args.max_retries * 5,
+        on_event=print_guided_event,
+        reasoning_budget_tokens=_reasoning_budget(args),
+        on_delta=make_delta_printer(args),
+        deliberation=DeliberationConfig(
+            forced_schema=not args.no_deliberation,
+            predict_verify=not args.no_deliberation,
+            self_consistency_k=args.vote,
+            critic=args.critic,
+        ),
     )
 
 
@@ -290,13 +482,17 @@ def build_orchestrator(args: argparse.Namespace) -> OrchestratorAgent:
 # ---------------------------------------------------------------------------
 
 async def run_task(args: argparse.Namespace) -> None:
+    mode = "guided" if args.guided else ("orchestrator" if args.orchestrate else "ReAct")
     print(f"\nModel   : {args.model}")
     print(f"Region  : {args.region}")
-    print(f"Mode    : {'orchestrator' if args.orchestrate else 'ReAct'}")
+    print(f"Mode    : {mode}")
     print(f"Task    : {args.task}")
     print(_DOUBLE)
 
-    if args.orchestrate:
+    if args.guided:
+        agent = build_guided_agent(args)
+        await agent.run(args.task)
+    elif args.orchestrate:
         agent = build_orchestrator(args)
         await agent.run(args.task)
     else:
@@ -304,6 +500,9 @@ async def run_task(args: argparse.Namespace) -> None:
         try:
             await agent.run(args.task)
         finally:
+            print(f"\n{_DOUBLE}")
+            print(f"  Total tokens: {_fmt_usage(agent._total_usage)}")
+            print(_DOUBLE)
             if pt._state["browser"]:
                 await pt.stop_browser()
 
@@ -313,13 +512,17 @@ async def run_task(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 async def run_repl(args: argparse.Namespace) -> None:
-    mode = "orchestrator" if args.orchestrate else "ReAct"
+    mode = "guided" if args.guided else ("orchestrator" if args.orchestrate else "ReAct")
     print(f"\nPlaywright Agent — Interactive Mode ({mode})")
     print(f"Model : {args.model}  |  Region : {args.region}")
     print("Commands:  exit | tools")
     print(_DOUBLE)
 
-    agent = build_orchestrator(args) if args.orchestrate else build_react_agent(args)
+    agent = (
+        build_guided_agent(args) if args.guided
+        else build_orchestrator(args) if args.orchestrate
+        else build_react_agent(args)
+    )
 
     while True:
         try:
@@ -337,7 +540,7 @@ async def run_repl(args: argparse.Namespace) -> None:
             print_tool_list()
             continue
 
-        if args.orchestrate:
+        if args.guided or args.orchestrate:
             await agent.run(task)
         else:
             try:
@@ -360,6 +563,14 @@ async def main() -> None:
     if args.list_tools:
         print_tool_list()
         return
+
+    # Screenshot/cursor settings live on the tool layer's global state, so all
+    # three modes pick them up without threading them through every agent.
+    pt._state["show_cursor"] = not args.no_cursor
+    if args.screenshot_dir:
+        os.makedirs(args.screenshot_dir, exist_ok=True)
+        pt._state["screenshot_dir"] = args.screenshot_dir
+        print(f"Frames  : {args.screenshot_dir}")
 
     if args.task:
         await run_task(args)
